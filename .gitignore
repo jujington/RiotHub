@@ -1,0 +1,10 @@
+# build output
+build/
+dist/
+installer/
+*.spec
+__pycache__/
+*.pyc
+# never commit anyone's saved logins or local data
+*.rasbak
+accounts/
