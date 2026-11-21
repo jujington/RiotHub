@@ -90,7 +90,7 @@ except Exception:
 
 APP_NAME = "RiotHub"
 OLD_APP_NAMES = ["RiotAccountSwitcher"]      # data folders from before the rename
-VERSION = "1.3.0"   # stamped from the release tag by the GitHub workflow
+VERSION = "1.3.1"   # stamped from the release tag by the GitHub workflow
 APP_TITLE = "RiotHub"
 # GitHub "owner/repo" whose releases this app updates from. Leave empty to turn updates off.
 UPDATE_REPO = ""
@@ -271,7 +271,11 @@ def avatar_color(name):
 
 
 # ================================================================ login files
+ACC_GEN = [0]      # bumped whenever saved logins change, so App.accounts() re-reads
+
+
 def _rm(p: Path):
+    ACC_GEN[0] += 1
     if p.is_dir():
         shutil.rmtree(p, ignore_errors=True)
     elif p.exists():
@@ -316,6 +320,14 @@ PREV_DIR_NAME = "_previous_login"
 
 
 def snapshot(dst_root: Path, keep_prev=True):
+    ACC_GEN[0] += 1
+    try:
+        return _snapshot(dst_root, keep_prev)
+    finally:
+        ACC_GEN[0] += 1      # again once the folder really exists
+
+
+def _snapshot(dst_root: Path, keep_prev=True):
     if keep_prev and dst_root.parent == ACC_DIR and has_login(dst_root):
         prev = APP_DIR / PREV_DIR_NAME / dst_root.name
         try:
@@ -390,23 +402,33 @@ def close_client(timeout=15, allow_prompt=True):
     quit_client_gracefully()
     wanted = {p.lower() for p in CLIENT_PROCS}
 
-    def gone(wait):
+    def kill(names):
+        for p in names:
+            subprocess.run(["taskkill", "/F", "/T", "/IM", p], capture_output=True,
+                           creationflags=NO_WINDOW)
+
+    def gone(wait, rekill=False):
         end = time.time() + wait
+        last_kill = time.time()
         while time.time() < end:
-            if not (running_processes() & wanted):
+            left = running_processes() & wanted
+            if not left:
                 time.sleep(1)
                 try:
                     LOCKFILE.unlink(missing_ok=True)  # stale after a forced close
                 except Exception:
                     pass
                 return True
+            if rekill and time.time() - last_kill > 2:
+                # the crash handler / League client can outlive (or restart after) the
+                # first kill - keep at it instead of failing and making you try again
+                kill([p for p in CLIENT_PROCS if p.lower() in left])
+                last_kill = time.time()
             time.sleep(0.4)
         return False
 
-    for p in CLIENT_PROCS + ["Deceive.exe"]:
-        subprocess.run(["taskkill", "/F", "/IM", p], capture_output=True,
-                       creationflags=NO_WINDOW)
-    if gone(min(timeout, 6)):
+    kill(CLIENT_PROCS + ["Deceive.exe"])
+    if gone(min(timeout, 10), rekill=True):
         return True
     # still there: it's almost always a Riot Client running as administrator
     left = [p for p in CLIENT_PROCS if p.lower() in running_processes()]
@@ -7703,11 +7725,12 @@ class App(tk.Tk):
         self.cv.pack(fill="both", expand=True)
         self.cv.bind("<Configure>", lambda e: (self.redraw(), self._sheets_relayout()))
         self.cv.bind("<Motion>", self.on_motion)
-        self.cv.bind("<Leave>", lambda e: self.set_hover(None))
+        self.cv.bind("<Leave>", lambda e: (setattr(self, "mouse", (None, None)),
+                                           self.set_hover(None)))
         self.cv.bind("<ButtonPress-1>", self.on_press)
         self.cv.bind("<B1-Motion>", self.on_drag)
         self.cv.bind("<ButtonRelease-1>", self.on_release)
-        self.cv.bind("<Double-Button-1>", lambda e: self.fire("dbl"))
+        self.cv.bind("<Double-Button-1>", lambda e: self.fire("dbl", e))
         self.cv.bind("<Button-3>", lambda e: self.fire("right", e))
         self.bind_all("<MouseWheel>", self.on_wheel)
         self.key("<Control-f>", lambda e: self.focus_search())
@@ -7799,10 +7822,30 @@ class App(tk.Tk):
             pass
 
     def accounts(self):
+        """Saved accounts in display order. Called many times per frame, so it's cached:
+        the folder is only listed again when its modification time changes (adding,
+        deleting or renaming an account), checked at most twice a second."""
+        now = time.time()
+        c = getattr(self, "_acc_cache", None)
+        order = tuple(self.state_.get("order", [])) + (ACC_GEN[0],)
+        if c and now - c[0] < 0.5 and c[2] == order:
+            return list(c[3])
+        try:
+            mt = ACC_DIR.stat().st_mtime_ns if ACC_DIR.exists() else 0
+        except OSError:
+            mt = 0
+        if c and c[1] == mt and c[2] == order:
+            self._acc_cache = (now, mt, order, c[3])
+            return list(c[3])
         names = [p.name for p in ACC_DIR.iterdir()
                  if p.is_dir() and not p.name.endswith(".tmp")] if ACC_DIR.exists() else []
-        order = [n for n in self.state_.get("order", []) if n in names]
-        return order + sorted((n for n in names if n not in order), key=str.lower)
+        od = [n for n in self.state_.get("order", []) if n in names]
+        res = od + sorted((n for n in names if n not in od), key=str.lower)
+        self._acc_cache = (now, mt, order, tuple(res))
+        return res
+
+    def accounts_changed(self):
+        self._acc_cache = None
 
     def persist(self):
         self.state_["order"] = self.accounts()
@@ -7962,7 +8005,14 @@ class App(tk.Tk):
         return self._fonts[k]
 
     def measure(self, s, size=10, weight="normal"):
-        return self.fobj(size, weight).measure(s)
+        k = (s, size, weight)
+        c = self.__dict__.setdefault("_mcache", {})
+        v = c.get(k)
+        if v is None:
+            if len(c) > 6000:
+                c.clear()
+            v = c[k] = self.fobj(size, weight).measure(s)
+        return v
 
     def wrap(self, s, size, maxw, weight="normal", max_lines=None):
         """Word-wrap text to a width (in pixels) using the real font metrics."""
@@ -7995,7 +8045,9 @@ class App(tk.Tk):
         im = self._shapes.get(key)
         if im is not None:
             self._shapes.move_to_end(key)
-            return im
+            self._shape_pil = self.__dict__.get("_pil_of", {}).get(key)
+            if self._shape_pil is not None:
+                return im
         s_ = 3
         W, H = w * s_, h * s_
         rr = max(0, min(r, w / 2, h / 2)) * s_
@@ -8034,12 +8086,41 @@ class App(tk.Tk):
                 big = Image.composite(col, big, ring)
         if alpha < 1:
             big.putalpha(big.getchannel("A").point(lambda v: int(v * alpha)))
-        im = ImageTk.PhotoImage(big.resize((w, h), Image.LANCZOS))
+        small = big.resize((w, h), Image.LANCZOS)
+        self._shape_pil = small
+        pil_of = self.__dict__.setdefault("_pil_of", {})
+        if len(pil_of) > 400:
+            pil_of.clear()
+        pil_of[key] = small
+        im = ImageTk.PhotoImage(small)
         self._shapes[key] = im
         if len(self._shapes) > 5000:
             for _ in range(800):
                 self._shapes.popitem(last=False)
         return im
+
+    def shape_parts(self, w, h, r, fill, outline, width, depth, rr):
+        """A big rounded rectangle split into 3 opaque bands plus 4 small corners. Opaque
+        images are just copied to the screen; only the corners need alpha blending (Tk
+        does that in software, so blending a whole panel every frame was costly)."""
+        key = ("parts", w, h, round(r, 1), fill, outline, width, round(depth, 2), rr)
+        got = self._shapes.get(key)
+        if got is not None:
+            self._shapes.move_to_end(key)
+            return got
+        self.shape_img(w, h, r, fill, outline, width, depth)          # builds the PIL image
+        big = self._shape_pil
+        out = []
+        for box, opaque in (((rr, 0, w - rr, rr), True), ((0, rr, w, h - rr), True),
+                            ((rr, h - rr, w - rr, h), True), ((0, 0, rr, rr), False),
+                            ((w - rr, 0, w, rr), False), ((0, h - rr, rr, h), False),
+                            ((w - rr, h - rr, w, h), False)):
+            piece = big.crop(box)
+            if opaque:
+                piece = piece.convert("RGB")
+            out.append((ImageTk.PhotoImage(piece), box[0], box[1]))
+        self._shapes[key] = out
+        return out
 
     def rrect(self, x1, y1, x2, y2, r, **kw):
         if HAS_PIL and not kw.get("dash"):
@@ -8054,8 +8135,18 @@ class App(tk.Tk):
             if depth is None:     # bordered panels get gentle depth everywhere by default
                 depth = 1.0 if (out and fill and H >= 34 and W >= 60) else 0.0
             try:
-                img = self.shape_img(W, H, r, fill, out, kw.get("width", 1), depth,
-                                     kw.get("alpha", 1.0))
+                a_ = kw.get("alpha", 1.0)
+                rr = int(min(r, W / 2, H / 2) + 1.5)
+                if fill and a_ >= 1 and W * H >= 9000 and W > 2 * rr + 4 and H > 2 * rr + 4:
+                    parts = self.shape_parts(W, H, r, fill, out, kw.get("width", 1), depth, rr)
+                    tags = kw.get("tags", ())
+                    first = None
+                    for ph, dx, dy in parts:
+                        i_ = self.cv.create_image(X1 + dx, Y1 + dy, image=ph, anchor="nw",
+                                                  tags=tags)
+                        first = first or i_
+                    return first
+                img = self.shape_img(W, H, r, fill, out, kw.get("width", 1), depth, a_)
                 return self.cv.create_image(X1, Y1, image=img, anchor="nw",
                                             tags=kw.get("tags", ()))
             except Exception:
@@ -8068,9 +8159,13 @@ class App(tk.Tk):
         kw.setdefault("outline", "")
         return self.cv.create_polygon(pts, smooth=True, **kw)
 
-    def soft(self, x1, y1, x2, y2, r, color="#000000", alpha=110, spread=14, dy=6, tags=()):
-        """Blurred shadow / glow behind a rounded box."""
-        if not HAS_PIL:
+    SOFT_ON = False     # big blurred images are expensive for Tk to blend on Windows
+
+    def soft(self, x1, y1, x2, y2, r, color="#000000", alpha=110, spread=14, dy=6, tags=(),
+             keep=False):
+        """Blurred shadow / glow behind a rounded box. Only drawn for things that float
+        above the page (keep=True): Tk blends these in software on every redraw."""
+        if not HAS_PIL or not (keep or self.SOFT_ON):
             return
         W, H = int(x2 - x1), int(y2 - y1)
         if W < 2 or H < 2:
@@ -8101,12 +8196,23 @@ class App(tk.Tk):
 
     def text(self, x, y, s, size=10, weight="normal", fill=None, maxw=None, **kw):
         s = str(s)
-        if maxw:
-            fo = self.fobj(size, weight)
-            if fo.measure(s) > maxw:
-                while s and fo.measure(s + "…") > maxw:
-                    s = s[:-1]
-                s += "…"
+        if maxw and s:
+            if self.measure(s, size, weight) > maxw:
+                key = (s, size, weight, int(maxw))
+                tc = self.__dict__.setdefault("_tcache", {})
+                cut = tc.get(key)
+                if cut is None:
+                    lo, hi = 0, len(s)          # binary search, not one measure per char
+                    while lo < hi:
+                        mid = (lo + hi + 1) // 2
+                        if self.measure(s[:mid] + "…", size, weight) <= maxw:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                    if len(tc) > 4000:
+                        tc.clear()
+                    cut = tc[key] = s[:lo] + "…"
+                s = cut
         kw.setdefault("anchor", "w")
         return self.cv.create_text(x, y, text=s, font=(self.UI, size, weight),
                                    fill=fill or TEXT, **kw)
@@ -8212,15 +8318,8 @@ class App(tk.Tk):
     def skel(self, x0, y0, x1, y1, r=8, phase=0.0, tags=()):
         """One shimmering placeholder block. A soft highlight sweeps left to right across
         every skeleton on screen together, so loading looks calm and deliberate."""
-        t = time.time()
-        sweep = ((t * 0.5) % 1.6) - 0.3                # -0.3 .. 1.3 across the window
-        w = max(1.0, self.cv.winfo_width())
-        d = abs((x0 + x1) / 2 / w - sweep)
-        glow = max(0.0, 1 - d / 0.28) ** 2
-        base = mix(SURFACE, CARD, 0.55 + 0.1 * math.sin(t * 2.2 + phase))
-        col = mix(base, mix(CARD_HI, SOFT, 0.08), round(glow * 6) / 6 * 0.85)
+        col = mix(SURFACE, CARD, 0.6 + 0.15 * ((int(phase * 2)) % 2))
         self.rrect(x0, y0, x1, y1, r, fill=col, depth=0, tags=tags)
-        self._shimmer = True      # light refresh rate: loading shouldn't cost CPU
 
     def skeleton_rows(self, x0, x1, y, n=4, row_h=58, avatar=True, panel=True):
         """A list's worth of skeleton rows (avatar + two lines). Returns the bottom y."""
@@ -8382,21 +8481,18 @@ class App(tk.Tk):
         self._tw = {k: v for k, v in self._tw.items() if not k.startswith(prefixes)}
 
     def hv(self, key, on=None):
-        """0..1 hover amount for `key`, eased in/out (quantised so shapes stay cached)."""
+        """1.0 while `key` is hovered, else 0.0. Instant on purpose: an eased hover meant
+        ~15 full redraws per mouse-over, which is what made the app feel sluggish."""
         on = (self.hover == key) if on is None else bool(on)
-        v = self.tween("hv:" + str(key), 1.0 if on else 0.0, 0.14 if on else 0.26)
-        return round(v * 8) / 8
+        return 1.0 if on else 0.0
 
     def pressed(self, key):
-        """0..1 'pushed in' amount: snaps down fast on press, eases back on release."""
-        down = bool(self.press) and self.press[0] == key and self.hover == key
-        v = self.tween("pr:" + str(key), 1.0 if down else 0.0, 0.06 if down else 0.22)
-        return round(v * 4) / 4
+        """1.0 while `key` is held down (instant, like hover)."""
+        return 1.0 if (self.press and self.press[0] == key and self.hover == key) else 0.0
 
     def hcol(self, key, base, hot, on=None):
         f = self.hv(key, on)
-        pr = self.pressed(key) if self.press else (
-            self.pressed(key) if ("pr:" + str(key)) in self._tw else 0)
+        pr = self.pressed(key) if self.press else 0
         if f <= 0 and not pr:
             return base
         if not (isinstance(base, str) and isinstance(hot, str) and base.startswith("#")
@@ -8560,7 +8656,8 @@ class App(tk.Tk):
             lmark = (c.find_all() or (0,))[-1]
             self.draw_layers(w, h)
             for item in c.find_all():
-                if item > lmark and "lyrwin" not in c.gettags(item):
+                tg = c.gettags(item)
+                if item > lmark and "lyrwin" not in tg and "lyrscrim" not in tg:
                     c.addtag_withtag("lyr", item)
             lyr_more, lyr_shim = self._more, self._shimmer
             self._more = self._shimmer = False
@@ -8584,13 +8681,10 @@ class App(tk.Tk):
             self.after(16, self.redraw)
         elif self._shimmer:
             self.after(60, self.redraw)
-        bg = getattr(self, "_bg_pil", None)
-        if bg is not None and getattr(self, "_fade_ident", None) != (id(bg), w, h) and \
-                not getattr(self, "_warm_job", None):
-            self._warm_job = self.after(400, self._warm_fades)
+
 
     # ---- page & tab transitions: content glides in while the background fades it up
-    PAGE_T, TAB_T = 0.34, 0.26
+    PAGE_T, TAB_T = 0.2, 0.16
 
     def draw_transition(self, marker, w, h, anim):
         if not anim:
@@ -8598,7 +8692,7 @@ class App(tk.Tk):
         now = time.time()
         c = self.cv
         if now - self.page_t < self.PAGE_T:
-            age, dur, mk, y0, dist = now - self.page_t, self.PAGE_T, marker, 0, 16
+            age, dur, mk, y0, dist = now - self.page_t, self.PAGE_T, marker, 0, 10
         elif now - self.tab_t < self.TAB_T and self._tab_mark and self._tab_mark[2] == self.page:
             age, dur, (mk, y0, _) = now - self.tab_t, self.TAB_T, self._tab_mark
             dist = 10
@@ -8611,12 +8705,8 @@ class App(tk.Tk):
             for item in c.find_all():
                 if item > mk:
                     c.move(item, 0, dy)
-        if y0 > 0:
-            return      # tabs just glide; only whole pages fade (keeps memory down)
-        fade = 1 - ease_out(age / (dur * 0.85))
-        ph = self.fade_photo(w, h, fade)
-        if ph:
-            c.create_image(self.SIDE + 1, 0, image=ph, anchor="nw")
+        # (no fade overlay: blending a full-window image every frame cost more than it
+        # was worth on Windows - the slide alone reads as a transition)
 
     FADE_LEVELS = 4
 
@@ -8818,6 +8908,11 @@ class App(tk.Tk):
         if L.closed:
             return
         L.closed = True
+        try:
+            if L.__dict__.get("_scrim_item"):
+                self.cv.delete(L._scrim_item)
+        except tk.TclError:
+            pass
         if L in self.layers:
             self.layers.remove(L)
         try:
@@ -8875,15 +8970,29 @@ class App(tk.Tk):
             if getattr(L, "opaque", False):       # lock screen: hide everything behind it
                 self.cv.create_rectangle(0, 0, w, h, fill=mix(BG, "#000000", 0.3), outline="")
             else:
-                sc = self.scrim_photo(w, h, max(1, round(k * 4)))
+                lvl = max(1, round(k * 4))
+                sc = self.scrim_photo(w, h, lvl)
                 if sc:
-                    self.cv.create_image(0, 0, image=sc, anchor="nw")
+                    item = L.__dict__.get("_scrim_item")
+                    try:
+                        alive = item and self.cv.type(item)
+                    except tk.TclError:
+                        alive = False
+                    if alive:
+                        if L.__dict__.get("_scrim_lvl") != lvl:
+                            self.cv.itemconfigure(item, image=sc)
+                        if self.cv.find_above(item):        # stacked dialogs only
+                            self.cv.tag_raise(item)
+                    else:
+                        L._scrim_item = self.cv.create_image(0, 0, image=sc, anchor="nw",
+                                                             tags=("lyrscrim",))
+                    L._scrim_lvl = lvl
             pw, ph = (int(v) for v in L.size(w, h))
             x0 = int((w - pw) / 2)
             y0 = int(max(16, (h - ph) / 2 - 6) + round((1 - k) * 18))
             x1, y1 = x0 + pw, y0 + ph
             L.box = (x0, y0, x1, y1)
-            self.soft(x0, y0, x1, y1, 20, "#000000", alpha=int(170 * k), spread=26, dy=14)
+            self.soft(x0, y0, x1, y1, 20, "#000000", alpha=int(170 * k), spread=26, dy=14, keep=True)
             self.rrect(x0, y0, x1, y1, 20, fill=SURFACE,
                        outline=mix(LINE, "#ffffff", 0.09), depth=0)
             # the light catching the panel's top edge
@@ -8934,7 +9043,8 @@ class App(tk.Tk):
         marker = (c.find_all() or (0,))[-1]
         self.draw_layers(w, h)
         for item in c.find_all():
-            if item > marker and "lyrwin" not in c.gettags(item):
+            tg = c.gettags(item)
+            if item > marker and "lyrwin" not in tg and "lyrscrim" not in tg:
                 c.addtag_withtag("lyr", item)
         more, shim = self._more, self._shimmer
         self._more, self._shimmer = saved
@@ -9239,7 +9349,7 @@ class App(tk.Tk):
         y += dy
         base = mix(BG, SURFACE, 0.4)
         fill = mix(base, mix(SURFACE, CARD, 0.5), 0.35 + 0.65 * k)
-        self.soft(x, y, x + width, y + height, 14, "#000000", int(150 * round(k * 4) / 4), 18, 9)
+        self.soft(x, y, x + width, y + height, 14, "#000000", int(150 * round(k * 4) / 4), 18, 9, keep=True)
         self.rrect(x, y, x + width, y + height, 14, fill=fill,
                    outline=mix(fill, mix(LINE, "#ffffff", 0.1), k), depth=k)
         cy = y + PADV
@@ -9349,7 +9459,7 @@ class App(tk.Tk):
         y = my + 22 if my + 22 + th < h - 6 else my - th - 12
         y += (1 - a) * 4
         bg = mix(BG, mix(SURFACE, CARD_HI, 0.55), a)
-        self.soft(x, y, x + tw, y + th, 10, alpha=int(150 * a), spread=10, dy=4)
+        self.soft(x, y, x + tw, y + th, 10, alpha=int(150 * a), spread=10, dy=4, keep=True)
         self.rrect(x, y, x + tw, y + th, 10, fill=bg,
                    outline=mix(bg, mix(LINE, "#ffffff", 0.08), a), depth=a)
         self.cv.create_text(x + 12, y + th / 2, text=tip, anchor="w", width=maxw,
@@ -9402,7 +9512,7 @@ class App(tk.Tk):
             self.hit(key, click=lambda t=t: t.update(t=time.time() - life), tip=None,
                      box=(x0, y0, xr, yb))
             bg = mix(BG, mix(SURFACE, col, 0.1), vis)
-            self.soft(x0, y0, xr, yb, 14, "#000000", alpha=int(150 * vis), spread=14, dy=7)
+            self.soft(x0, y0, xr, yb, 14, "#000000", alpha=int(150 * vis), spread=14, dy=7, keep=True)
             if vis > 0.5:
                 self.soft(x0, y0, xr, yb, 14, col, alpha=int(40 * vis), spread=10, dy=0)
             self.rrect(x0, y0, xr, yb, 14, fill=bg,
@@ -9431,7 +9541,7 @@ class App(tk.Tk):
         self._ovl_more = True
         col = DANGER if p.get("error") else (GOOD if p.get("done") else ACCENT)
         ph = self.tween("prog:h", ph, 0.25)
-        self.soft(x0, y0, x0 + pw, y0 + ph, 18, alpha=160, spread=18, dy=10)
+        self.soft(x0, y0, x0 + pw, y0 + ph, 18, alpha=160, spread=18, dy=10, keep=True)
         self.soft(x0, y0, x0 + pw, y0 + ph, 18, col, alpha=45, spread=12, dy=0)
         self.rrect(x0, y0, x0 + pw, y0 + ph, 18, fill=SURFACE, outline=mix(SURFACE, col, 0.5),
                    depth=1.0)
@@ -9528,7 +9638,7 @@ class App(tk.Tk):
                 im = Image.composite(Image.new("RGBA", (w, h), _rgb(ACCENT) + (255,)), im, glow)
                 d = ImageDraw.Draw(im)
                 d.line((0, 1, w, 1), fill=_rgb(mix(BAR, "#ffffff", 0.05)) + (255,))
-            cache[key] = ImageTk.PhotoImage(im)
+            cache[key] = ImageTk.PhotoImage(im.convert("RGB"))   # opaque: no blending
         except Exception:
             cache[key] = None
         return cache[key]
@@ -12757,6 +12867,14 @@ class App(tk.Tk):
     # ------------------------------------------------------------ store
     def store_hits(self):
         """[(skin, account, price)] wishlisted skins currently in someone's store."""
+        memo = getattr(self, "_hits_memo", None)
+        if memo and time.time() - memo[0] < 1.0:
+            return memo[1]
+        res = self._store_hits()
+        self._hits_memo = (time.time(), res)
+        return res
+
+    def _store_hits(self):
         wish = set(self.state_["wishlist"])
         if not wish:
             return []
@@ -13827,26 +13945,31 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ events
     def current_key(self):
-        for item in self.cv.find_withtag("current"):
-            for t in self.cv.gettags(item):
-                if t.startswith("hit:") and (not self.layers or self.key_ok(t[4:])):
-                    return t[4:]
-        try:
-            x = self.cv.winfo_pointerx() - self.cv.winfo_rootx()
-            y = self.cv.winfo_pointery() - self.cv.winfo_rooty()
-        except Exception:
+        """What's under the mouse. Worked out from geometry: Tk's own 'current' item is
+        empty for a moment after every redraw, and relying on it silently dropped clicks."""
+        x, y = getattr(self, "mouse", (None, None))
+        if x is None:
             return None
+        ok = (lambda k: self.key_ok(k)) if self.layers else (lambda k: True)
         for (x0, y0, x1, y1), key in reversed(self.hit_boxes):
-            if x0 <= x <= x1 and y0 <= y <= y1 and key in self.hits and \
-                    (not self.layers or self.key_ok(key)):
+            if x0 <= x <= x1 and y0 <= y <= y1 and key in self.hits and ok(key):
                 return key
+        try:
+            under = self.cv.find_overlapping(x, y, x, y)
+        except tk.TclError:
+            return None
+        for item in reversed(under):           # topmost first
+            for t in self.cv.gettags(item):
+                if t.startswith("hit:") and t[4:] in self.hits and ok(t[4:]):
+                    return t[4:]
         return None
 
     def on_motion(self, e):
-        if self.kbd_focus and abs(e.x - self.mouse[0]) + abs(e.y - self.mouse[1]) > 3:
+        px, py = self.mouse if self.mouse and self.mouse[0] is not None else (e.x, e.y)
+        self.mouse = (e.x, e.y)
+        if self.kbd_focus and abs(e.x - px) + abs(e.y - py) > 3:
             self.kbd_focus = False      # mouse is back: hide the keyboard focus ring
             self.redraw()
-        self.mouse = (e.x, e.y)
         self.set_hover(self.current_key())
 
     def set_hover(self, key):
@@ -13860,6 +13983,8 @@ class App(tk.Tk):
             self.layer_redraw() if self.layers else self.redraw()
 
     def fire(self, kind, event=None):
+        if event is not None and hasattr(event, "x"):
+            self.mouse = (event.x, event.y)
         key = self.current_key()
         h = self.hits.get(key) if key else None
         fn = h and h.get(kind)
@@ -14550,17 +14675,28 @@ class App(tk.Tk):
     # ------------------------------------------------------------ worker helpers
     def run(self, fn, *args, guard=True):
         if self.busy:
+            # don't silently ignore a click: do it as soon as the current job finishes
+            if getattr(fn, "__self__", None) is self and fn.__name__ in (
+                    "_open_login", "_save", "_switch", "do_switch"):
+                self._queued = (fn, args, guard)
+                self.toast("Finishing the current task first - yours starts right after.",
+                           tray=False)
+                return True
+            self.toast("RiotHub is still busy with the last action - try again in a moment.",
+                       tray=False)
             return False
-        if guard:
-            g = games_running()
-            if g:
-                self.notify("Game running", f"Close {', '.join(g)} before switching.")
-                return False
         self.busy = True
         self._tick()
 
         def worker():
             try:
+                if guard:       # checked here, off the UI thread (tasklist is slow)
+                    g = games_running()
+                    if g:
+                        self.end_progress(f"Close {', '.join(g)} first.")
+                        self.call_ui(lambda: self.notify(
+                            "Game running", f"Close {', '.join(g)} before switching."))
+                        return
                 fn(*args)
             except Exception as e:
                 msg = describe_err(e)
@@ -14589,6 +14725,11 @@ class App(tk.Tk):
 
     def _done(self):
         self.busy = False
+        self.accounts_changed()
+        q = getattr(self, "_queued", None)
+        if q:
+            self._queued = None
+            self.after(150, lambda: self.run(q[0], *q[1], guard=q[2]))
         self.persist()
         self.redraw()
 
@@ -16339,6 +16480,7 @@ class App(tk.Tk):
                 self.notify("Rename", f"'{new}' already exists.")
                 return
             (ACC_DIR / name).rename(ACC_DIR / new)
+            ACC_GEN[0] += 1
             for d in (META_DIR, PREFS_DIR):
                 if (d / f"{name}.json").exists():
                     (d / f"{name}.json").replace(d / f"{new}.json")
