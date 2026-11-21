@@ -1,5 +1,5 @@
 # Builds RiotHub.exe + "RiotHub Setup.exe" and publishes a GitHub release
-# whenever you push a tag like v11.1  (git tag v11.1 && git push origin v11.1)
+# whenever a release/tag like v1.1.0 is created
 name: Release
 
 on:
@@ -36,8 +36,11 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"APP_VERSION={tag}\n")
 
-      - name: Build RiotHub.exe
-        run: python -m PyInstaller --noconfirm --onefile --windowed --name "RiotHub" --icon logo.ico --collect-all av RiotHub.pyw
+      - name: Build RiotHub.exe (portable)
+        run: python -m PyInstaller --noconfirm --onefile --windowed --name "RiotHub" --icon logo.ico --collect-all av --workpath build/onefile RiotHub.pyw
+
+      - name: Build RiotHub folder (for the installer, starts faster)
+        run: python -m PyInstaller --noconfirm --onedir --windowed --name "RiotHub" --icon logo.ico --collect-all av --workpath build/onedir --distpath dist/app RiotHub.pyw
 
       - name: Build installer
         shell: pwsh

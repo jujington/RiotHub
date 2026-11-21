@@ -89,7 +89,7 @@ except Exception:
 
 APP_NAME = "RiotHub"
 OLD_APP_NAMES = ["RiotAccountSwitcher"]      # data folders from before the rename
-VERSION = "11.0"
+VERSION = "1.2.0"   # stamped from the release tag by the GitHub workflow
 APP_TITLE = "RiotHub"
 # GitHub "owner/repo" whose releases this app updates from. Leave empty to turn updates off.
 UPDATE_REPO = ""
@@ -515,7 +515,7 @@ DEFAULT_SETTINGS = {
     "hotkeys": True, "theme": "Violet", "layout": "grid", "streamer": False,
     "bg_refresh": True, "bg_minutes": 10, "status_mode": "online",
     "status_enabled": False, "status_engine": "builtin", "deceive_path": "", "wishlist_alerts": True,
-    "match_count": 10, "live_alerts": True, "animations": True, "rank_glow": True,
+    "match_count": 10, "live_alerts": True, "match_sound": False, "animations": True, "rank_glow": True,
     "overlay": False, "startup_account": None, "bg_image": "", "obs_overlay": False,
     "auto_offline": False, "offline_from": 0, "offline_to": 8, "pin": None,
     "auto_backup": None, "toured": False, "chat_control": True, "auto_live": True,
@@ -1426,6 +1426,153 @@ def parse_penalties(p):
     active = [i for i in active if not (len(i["kinds"]) == 1 and i["kinds"][0][0] == "Warning"
                                         and not i["expires"])] or active
     return {"checked": time.time(), "items": active}
+
+
+def chime_wav(path):
+    """Write a short, soft two-note chime (no bundled audio files needed)."""
+    import struct
+    import wave
+    rate = 44100
+    frames = bytearray()
+    for freq, length in ((880.0, 0.16), (1318.5, 0.34)):
+        n = int(rate * length)
+        for i in range(n):
+            t = i / rate
+            env = min(1.0, i / (rate * 0.006)) * math.exp(-5.5 * t)
+            v = env * (0.55 * math.sin(2 * math.pi * freq * t)
+                       + 0.18 * math.sin(4 * math.pi * freq * t))
+            frames += struct.pack("<h", int(max(-1, min(1, v)) * 21000))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+    return path
+
+
+def play_chime():
+    try:
+        import winsound
+    except ImportError:
+        return False
+    f = APP_DIR / "match-found.wav"
+    try:
+        if not f.exists():
+            chime_wav(f)
+        winsound.PlaySound(str(f), winsound.SND_FILENAME | winsound.SND_ASYNC
+                           | winsound.SND_NODEFAULT)
+        return True
+    except Exception:
+        return False
+
+
+UI_SOUNDS = {
+    # name: [(freq Hz, seconds, volume 0-1)] - all short and quiet on purpose
+    "tap": [(1850.0, 0.022, 0.16)],
+    "toggle": [(1320.0, 0.03, 0.15), (1760.0, 0.035, 0.12)],
+    "success": [(784.0, 0.07, 0.17), (1174.7, 0.16, 0.15)],
+    "error": [(415.3, 0.09, 0.17), (311.1, 0.16, 0.15)],
+}
+
+
+def ui_sound_wav(name, path):
+    import struct
+    import wave
+    rate = 44100
+    frames = bytearray()
+    for freq, length, vol in UI_SOUNDS[name]:
+        n = int(rate * length)
+        for i in range(n):
+            t = i / rate
+            env = min(1.0, i / (rate * 0.003)) * math.exp(-t / (length * 0.38))
+            v = env * vol * (math.sin(2 * math.pi * freq * t)
+                             + 0.25 * math.sin(4 * math.pi * freq * t))
+            frames += struct.pack("<h", int(max(-1, min(1, v)) * 32000))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+    return path
+
+
+def play_ui_sound(name):
+    try:
+        import winsound
+    except ImportError:
+        return False
+    f = APP_DIR / "sounds" / f"{name}.wav"
+    try:
+        if not f.exists():
+            ui_sound_wav(name, f)
+        winsound.PlaySound(str(f), winsound.SND_FILENAME | winsound.SND_ASYNC
+                           | winsound.SND_NODEFAULT)
+        return True
+    except Exception:
+        return False
+
+
+def flash_taskbar(widget, count=6):
+    """Flash RiotHub's taskbar button until it's focused (like the Riot Client does)."""
+    if sys.platform != "win32":
+        return
+
+    class FLASHWINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("hwnd", ctypes.c_void_p),
+                    ("dwFlags", ctypes.c_uint), ("uCount", ctypes.c_uint),
+                    ("dwTimeout", ctypes.c_uint)]
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetParent(widget.winfo_id()) or widget.winfo_id()
+        fi = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 0x3 | 0xC, count, 0)
+        u.FlashWindowEx(ctypes.byref(fi))
+    except Exception:
+        pass
+
+
+RANKED_BLOCKERS = ("Game ban", "Account restriction", "Queue restriction", "Queue delay")
+RANKED_LEVEL = 20
+
+
+def ranked_status(m, now=None):
+    """Can this account queue competitive right now?
+    Returns (state, short label, longer explanation); state is 'ready', 'blocked', 'level',
+    'expired' or None when we don't know enough yet."""
+    now = now or time.time()
+    if m.get("expired"):
+        return "expired", "Re-login", "The saved login expired. Log in once to check ranked."
+    pens = [i for i in (m.get("penalties") or {}).get("items") or []
+            if i.get("expires") is None or i["expires"] > now or (i.get("games") or 0) > 0]
+    block = [i for i in pens if any((k[0] if isinstance(k, (list, tuple)) else k)
+                                    in RANKED_BLOCKERS for k in i.get("kinds") or [])]
+    if block:
+        ends = [i["expires"] for i in block if i.get("expires")]
+        games = sum(i.get("games") or 0 for i in block)
+        if ends:
+            left = dur(max(ends) - now)
+            return "blocked", f"Ranked in {left}", f"Queue restricted for another {left}."
+        if games:
+            return ("blocked", f"{games} game{'s' if games != 1 else ''} left",
+                    f"Restricted for {games} more game{'s' if games != 1 else ''}.")
+        return "blocked", "Restricted", "This account has a queue restriction."
+    lvl = m.get("level")
+    if lvl is None:
+        return None, "", ""
+    if lvl < RANKED_LEVEL:
+        n = RANKED_LEVEL - lvl
+        return "level", f"Lvl {lvl}/{RANKED_LEVEL}", f"{n} more level{'s' if n != 1 else ''} until ranked."
+    return "ready", "Ranked ready", "Level 20+, no queue restrictions."
+
+
+def queue_elapsed(d):
+    """Seconds since the party started queueing (falls back to when we first saw it)."""
+    try:
+        return max(0.0, time.time() - datetime.fromisoformat(
+            str(d.get("queue_since")).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return max(0.0, time.time() - d.get("t", time.time()))
 
 
 def owned_ids(meta, kind):
@@ -3169,9 +3316,22 @@ def check_for_update(repo):
     # the app itself, not the "Setup" installer that sits next to it in each release
     exe = (next((a for a in exes if a["name"].lower() == f"{APP_TITLE}.exe".lower()), None)
            or next((a for a in exes if "setup" not in a["name"].lower()), None))
+    setup = next((a for a in exes if "setup" in a["name"].lower()), None)
     return {"version": tag.lstrip("vV"), "notes": (r.get("body") or "").strip(),
             "page": r.get("html_url"), "exe": exe and exe.get("browser_download_url"),
-            "size": exe and exe.get("size")}
+            "size": exe and exe.get("size"),
+            "setup": setup and setup.get("browser_download_url"),
+            "setup_size": setup and setup.get("size")}
+
+
+def is_installed_copy(exe=None):
+    """True when this is the installed RiotHub (Setup.exe), not the portable single file.
+    Installed copies update by re-running the new installer silently, which keeps the
+    fast-starting folder layout and the Start menu entries."""
+    if not getattr(sys, "frozen", False) and exe is None:
+        return False
+    d = Path(exe or sys.executable).parent
+    return (d / "unins000.exe").exists() or (d / "_internal").is_dir()
 
 
 def launch_via_client(product, lf=None):
@@ -3676,6 +3836,56 @@ def ease_out(t):
     return 1 - (1 - t) ** 3
 
 
+def ease_out_quint(t):
+    t = max(0.0, min(1.0, t))
+    return 1 - (1 - t) ** 5
+
+
+def ease_in_out(t):
+    t = max(0.0, min(1.0, t))
+    return 4 * t * t * t if t < 0.5 else 1 - (-2 * t + 2) ** 3 / 2
+
+
+def ease_out_back(t, s=1.15):
+    """Ease out with a small, quick overshoot (about 3%) - feels physical, not bouncy."""
+    t = max(0.0, min(1.0, t)) - 1
+    return 1 + t * t * ((s + 1) * t + s)
+
+
+EASES = {"out": ease_out, "quint": ease_out_quint, "inout": ease_in_out, "back": ease_out_back}
+
+
+def _vgrad(w, h, top, bottom, stop=1.0):
+    """Vertical gradient image from `top` to `bottom` (reaching it at `stop` of the height)."""
+    a, b = _rgb(top), _rgb(bottom)
+    col = Image.new("RGBA", (1, 256))
+    col.putdata([tuple(int(x + (y - x) * min(1.0, (i / 255) / max(0.01, stop)))
+                       for x, y in zip(a, b)) + (255,) for i in range(256)])
+    return col.resize((w, h), Image.BILINEAR)
+
+
+def _vgrad_l(w, h, top, bottom, stop=1.0):
+    col = Image.new("L", (1, 256))
+    col.putdata([int(top + (bottom - top) * min(1.0, (i / 255) / max(0.01, stop)))
+                 for i in range(256)])
+    return col.resize((w, h), Image.BILINEAR)
+
+
+class OrderedDictLRU(dict):
+    """Tiny size-capped cache (oldest entries drop out first)."""
+
+    def __init__(self, cap):
+        super().__init__()
+        self.cap = cap
+
+    def __setitem__(self, k, v):
+        if k in self:
+            super().__delitem__(k)
+        super().__setitem__(k, v)
+        while len(self) > self.cap:
+            super().__delitem__(next(iter(self)))
+
+
 def grab_window(win):
     """Screenshot of the app window (Windows), used as the blurred backdrop behind sheets."""
     if not HAS_PIL:
@@ -3699,8 +3909,9 @@ def grab_window(win):
 
 
 class RoundButton(tk.Canvas):
-    """Smooth rounded button for the pop-ups, with an eased hover. Behaves like the old
-    Label buttons (pack/grid/config(text=..., fg=...))."""
+    """Smooth rounded button for the pop-ups: eased hover, a pressed state, and the click
+    fires on release (drag off to cancel). Behaves like the old Label buttons
+    (pack/grid/config(text=..., fg=...))."""
     H, R = 38, 12
 
     def __init__(self, app, parent, text, color, cmd):
@@ -3709,35 +3920,87 @@ class RoundButton(tk.Canvas):
         except Exception:
             pbg = SURFACE
         super().__init__(parent, height=self.H, bg=pbg, highlightthickness=0, bd=0,
-                         cursor="hand2")
+                         cursor="hand2", takefocus=1)
         self.app, self.cmd, self.color, self.label, self.fg = app, cmd, color, text, TEXT
         self.font = (app.UI, 10, "bold")
-        self.f = 0.0
-        self._target = 0.0
+        self.f = 0.0          # hover
+        self.p = 0.0          # press
+        self.k = 0.0          # keyboard focus
+        self._target = self._ptarget = self._ktarget = 0.0
+        self._inside = False
         self._job = None
-        self.bind("<Button-1>", lambda e: self.cmd() if self.cmd else None)
-        self.bind("<Enter>", lambda e: self.animate(1.0))
-        self.bind("<Leave>", lambda e: self.animate(0.0))
+        self.bind("<ButtonPress-1>", self._down)
+        self.bind("<ButtonRelease-1>", self._up)
+        self.bind("<Enter>", lambda e: self._hover(True))
+        self.bind("<Leave>", lambda e: self._hover(False))
+        self.bind("<FocusIn>", lambda e: self._focus(True))
+        self.bind("<FocusOut>", lambda e: self._focus(False))
+        self.bind("<KeyPress-space>", lambda e: self._fire())
         self.render()
+
+    def _hover(self, on):
+        self._inside = on
+        self._target = 1.0 if on else 0.0
+        if not on:
+            self._ptarget = 0.0
+        self.animate()
+
+    def _focus(self, on):
+        self._ktarget = 1.0 if on else 0.0
+        self.animate()
+
+    def _down(self, e):
+        self._ptarget = 1.0
+        self.animate()
+
+    def _up(self, e):
+        was = self._ptarget
+        self._ptarget = 0.0
+        self.animate()
+        inside = 0 <= e.x <= self.winfo_width() and 0 <= e.y <= self.winfo_height()
+        if was and inside:
+            self._fire()
+
+    def _fire(self):
+        if self.cmd:
+            self.app.play_ui("tap")
+            self.cmd()
 
     def width_for(self):
         return int(self.app.measure(self.label or " ", 10, "bold") + 40)
+
+    def _bright(self):
+        """Accent-coloured buttons are 'primary': they get a sheen and a glow."""
+        try:
+            r, g, b = _rgb(self.color)
+            return max(r, g, b) - min(r, g, b) > 60
+        except Exception:
+            return False
 
     def render(self):
         w = self.width_for()
         super().configure(width=w)
         self.delete("all")
-        col = mix(self.color, "#ffffff", 0.12 * self.f)
-        img = self.app.shape_img(w, self.H, self.R, col, "", 0) if HAS_PIL else None
+        f, p, k = round(self.f * 8) / 8, round(self.p * 4) / 4, round(self.k * 4) / 4
+        col = mix(self.color, "#ffffff", 0.12 * f)
+        if p:
+            col = mix(col, mix(self.color, "#000000", 0.3), 0.6 * p)
+        ins = round(1.5 * p)
+        bw, bh = w - 2 * ins, self.H - 2 * ins
+        img = self.app.shape_img(bw, bh, self.R, col,
+                                 mix(col, ACCENT_HI, k) if k else "",
+                                 1.5 if k else 0, 1.0 - 0.5 * p) if HAS_PIL else None
         if img:
-            self.create_image(0, 0, image=img, anchor="nw")
+            self.create_image(ins, ins, image=img, anchor="nw")
             self._img = img
         else:
             self.create_rectangle(0, 0, w, self.H, fill=col, outline="")
-        self.create_text(w / 2, self.H / 2, text=self.label, fill=self.fg, font=self.font)
+        self.create_text(w / 2, self.H / 2 + 0.5 * p, text=self.label, fill=self.fg,
+                         font=self.font)
 
-    def animate(self, target):
-        self._target = target
+    def animate(self, target=None):
+        if target is not None:
+            self._target = target
         if self._job is None:
             self._step()
 
@@ -3748,14 +4011,23 @@ class RoundButton(tk.Canvas):
                 return
         except tk.TclError:
             return
-        d = self._target - self.f
-        if abs(d) < 0.05:
-            self.f = self._target
+        if not self.app.settings.get("animations", True):
+            self.f, self.p, self.k = self._target, self._ptarget, self._ktarget
             self.render()
             return
-        self.f += d * 0.35
+        moving = False
+        for attr, tgt, rate in (("f", self._target, 0.32), ("p", self._ptarget, 0.55),
+                                ("k", self._ktarget, 0.35)):
+            cur = getattr(self, attr)
+            d = tgt - cur
+            if abs(d) < 0.04:
+                setattr(self, attr, tgt)
+            else:
+                setattr(self, attr, cur + d * rate)
+                moving = True
         self.render()
-        self._job = self.after(16, self._step)
+        if moving:
+            self._job = self.after(16, self._step)
 
     def config(self, **kw):
         changed = False
@@ -3782,7 +4054,8 @@ class RoundButton(tk.Canvas):
 
 
 class RoundField(tk.Canvas):
-    """Rounded text field container; the Entry inside is what callers get back."""
+    """Rounded text field container; the Entry inside is what callers get back. The border
+    eases to the accent colour on focus."""
 
     def __init__(self, app, parent, var, show=""):
         try:
@@ -3792,29 +4065,61 @@ class RoundField(tk.Canvas):
         super().__init__(parent, height=42, bg=pbg, highlightthickness=0, bd=0)
         self.app = app
         self.focused = False
+        self.f = 0.0
+        self._job = None
+        self._hov = False
         self.entry = tk.Entry(self, textvariable=var, bg=CARD, fg=TEXT, insertbackground=TEXT,
                               relief="flat", bd=0, font=(app.UI, 11), highlightthickness=0,
-                              show=show, selectbackground=ACCENT)
+                              show=show, selectbackground=ACCENT, insertwidth=2)
         self.win = self.create_window(14, 21, window=self.entry, anchor="w")
         self.bind("<Configure>", lambda e: self.render())
         self.entry.bind("<FocusIn>", lambda e: self.set_focus(True), add="+")
         self.entry.bind("<FocusOut>", lambda e: self.set_focus(False), add="+")
+        self.bind("<Enter>", lambda e: self._hover(True))
+        self.bind("<Leave>", lambda e: self._hover(False))
         self.bind("<Button-1>", lambda e: self.entry.focus_set())
+
+    def _hover(self, on):
+        self._hov = on
+        self.render()
 
     def set_focus(self, on):
         self.focused = on
+        if self._job is None:
+            self._step()
+
+    def _step(self):
+        self._job = None
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        tgt = 1.0 if self.focused else 0.0
+        if not self.app.settings.get("animations", True) or abs(tgt - self.f) < 0.05:
+            self.f = tgt
+            self.render()
+            return
+        self.f += (tgt - self.f) * 0.3
         self.render()
+        self._job = self.after(16, self._step)
 
     def render(self):
         w = max(40, self.winfo_width())
         self.delete("bg")
+        f = round(self.f * 6) / 6
+        fill = mix(CARD, mix(CARD, "#ffffff", 0.03), f)
+        rest = mix(LINE, mix(LINE, "#ffffff", 0.08), 1.0 if self._hov else 0.0)
         if HAS_PIL:
-            img = self.app.shape_img(w, 42, 12, CARD, ACCENT if self.focused else LINE,
-                                     1.5 if self.focused else 1)
+            img = self.app.shape_img(w, 42, 12, fill, mix(rest, ACCENT, f), 1 + 0.6 * f, 0.6)
             self._img = img
             self.create_image(0, 0, image=img, anchor="nw", tags="bg")
         else:
             self.create_rectangle(0, 0, w, 42, fill=CARD, outline=LINE, tags="bg")
+        try:
+            self.entry.configure(bg=fill)
+        except tk.TclError:
+            pass
         self.tag_lower("bg")
         self.itemconfigure(self.win, width=max(20, w - 28))
 
@@ -3880,7 +4185,7 @@ class Sheet(tk.Frame):
         self.app.update_idletasks()
         self._shown = True
         self._layout()
-        self._anim(1.0, 0.24)
+        self._anim(1.0, 0.34)
         for wdg in self._walk(self):
             if isinstance(wdg, tk.Entry):
                 wdg.focus_set()
@@ -3902,7 +4207,7 @@ class Sheet(tk.Frame):
                 self.app.settings.get("animations", True):
             self._final()
             return
-        self._anim(0.0, 0.15)
+        self._anim(0.0, 0.17)
 
     def _final(self):
         if getattr(self, "_done", False):
@@ -3932,9 +4237,10 @@ class Sheet(tk.Frame):
             if self._closing and self._vis == 0 and self._card_item is not False:
                 self._final()
             return False
-        k = ease_out((now - self._t0) / self._dur)
+        raw = (now - self._t0) / self._dur
+        k = ease_out_back(raw, 0.7) if self._to > self._from else ease_in_out(raw)
         self._vis = self._from + (self._to - self._from) * k
-        if k >= 1:
+        if raw >= 1:
             self._vis = self._to
         self._apply()
         if self._vis == 0 and self._closing:
@@ -4622,7 +4928,8 @@ class UpdateSheet(Sheet):
         self.status.pack(fill="x", pady=(10, 0))
         bar = tk.Frame(f, bg=SURFACE)
         bar.pack(fill="x", pady=(12, 0))
-        can = bool(info.get("exe")) and getattr(sys, "frozen", False)
+        can = getattr(sys, "frozen", False) and bool(
+            info.get("setup") if is_installed_copy() else info.get("exe"))
         app.button(bar, "Install and restart" if can else "Download", ACCENT,
                    self.install if can else lambda: webbrowser.open(info.get("page") or "")
                    ).pack(side="right")
@@ -4640,11 +4947,18 @@ class UpdateSheet(Sheet):
         self.status.config(text="Downloading…")
         info = self.info
 
+        installed = is_installed_copy()
+        url = info["setup"] if installed else info["exe"]
+        size = info.get("setup_size") if installed else info.get("size")
+
         def work():
             try:
                 cur = Path(sys.executable)
-                new = cur.with_name(cur.stem + ".new.exe")
-                req = urllib.request.Request(info["exe"], headers={"User-Agent": UA})
+                if installed:
+                    new = Path(os.environ.get("TEMP") or APP_DIR) / f"RiotHub-Setup-{info['version']}.exe"
+                else:
+                    new = cur.with_name(cur.stem + ".new.exe")
+                req = urllib.request.Request(url, headers={"User-Agent": UA})
                 got = 0
                 with urllib.request.urlopen(req, timeout=60) as r, open(new, "wb") as fh:
                     while True:
@@ -4653,20 +4967,24 @@ class UpdateSheet(Sheet):
                             break
                         fh.write(chunk)
                         got += len(chunk)
-                        if info.get("size"):
-                            pct = int(100 * got / info["size"])
+                        if size:
+                            pct = int(100 * got / size)
                             self.app.call_ui(lambda p=pct: self.status.config(
                                 text=f"Downloading… {p}%"))
-                if info.get("size") and got != info["size"]:
+                if size and got != size:
                     raise RuntimeError("the download was incomplete")
-                bat = cur.with_name("finish_update.bat")
-                bat.write_text(
-                    "@echo off\r\n"
-                    f"for /l %%i in (1,1,40) do (tasklist /fi \"PID eq {os.getpid()}\" "
-                    f"| find \"{os.getpid()}\" >nul && timeout /t 1 /nobreak >nul)\r\n"
-                    f"move /y \"{new}\" \"{cur}\" >nul\r\n"
-                    f"start \"\" \"{cur}\"\r\n"
-                    "del \"%~f0\"\r\n", encoding="utf-8")
+                wait = (f"for /l %%i in (1,1,40) do (tasklist /fi \"PID eq {os.getpid()}\" "
+                        f"| find \"{os.getpid()}\" >nul && timeout /t 1 /nobreak >nul)\r\n")
+                if installed:
+                    bat = Path(new).with_suffix(".bat")
+                    body = (f"start \"\" /wait \"{new}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "
+                            f"/DIR=\"{cur.parent}\"\r\n"
+                            f"del \"{new}\" >nul 2>&1\r\n")
+                else:
+                    bat = cur.with_name("finish_update.bat")
+                    body = f"move /y \"{new}\" \"{cur}\" >nul\r\n"
+                bat.write_text("@echo off\r\n" + wait + body + f"start \"\" \"{cur}\"\r\n"
+                               "del \"%~f0\"\r\n", encoding="utf-8")
                 subprocess.Popen(["cmd", "/c", str(bat)], creationflags=NO_WINDOW)
                 self.app.call_ui(self.app.quit_app)
             except Exception as e:
@@ -5764,6 +6082,8 @@ class MiniWindow(tk.Toplevel):
             for wdg in (row, a, b):
                 wdg.bind("<Button-1>", lambda e, n=n: app.switch(n))
         live = app.live or {}
+        if live.get("party_id") and live.get("phase") == "none":
+            self.party(live)
         if live.get("phase") in ("pregame", "ingame"):
             tk.Frame(self.body, bg=LINE, height=1).pack(fill="x", pady=6)
             for p in live.get("players") or []:
@@ -5780,7 +6100,48 @@ class MiniWindow(tk.Toplevel):
                              font=(app.UI, 8)).pack(side="right", padx=(12, 0))
         tk.Label(self.body, text="Drag the top bar · right-click to close", bg=SURFACE, fg=DIM,
                  font=(app.UI, 7)).pack(fill="x", pady=(4, 0))
-        self.after(3000, self.render)
+        self.after(1000 if app.queueing() else 3000, self.render)
+
+    def party(self, live):
+        """Who's in your party, plus queue and open/closed - same as the Live page."""
+        app = self.app
+        tk.Frame(self.body, bg=LINE, height=1).pack(fill="x", pady=6)
+        q = live.get("queue") or ""
+        n = len(live.get("party") or [])
+        head = tk.Frame(self.body, bg=SURFACE)
+        head.pack(fill="x")
+        tk.Label(head, text=QUEUES.get(q, q.title() or "Custom"), bg=SURFACE, fg=TEXT,
+                 font=(app.UI, 9, "bold")).pack(side="left")
+        tk.Label(head, text=f"party of {n}" if n > 1 else "solo", bg=SURFACE, fg=MUTED,
+                 font=(app.UI, 8)).pack(side="left", padx=6)
+        for p in live.get("players") or []:
+            nm = (p.get("name") or "").split("#")[0] if not app.streamer() else ""
+            nm = "You" if p.get("me") else (nm or "Party member")
+            r = tk.Frame(self.body, bg=SURFACE)
+            r.pack(fill="x")
+            own = p.get("puuid") == live.get("party_owner")
+            tk.Label(r, text="★" if own else "●", bg=SURFACE, fg=GOLD if own else GOOD,
+                     font=(app.UI, 7)).pack(side="left")
+            tk.Label(r, text=f" {nm}", bg=SURFACE, fg=TEXT, font=(app.UI, 8, "bold"),
+                     anchor="w").pack(side="left")
+            if not app.settings.get("focus_mode") or p.get("me"):
+                tk.Label(r, text=ASSETS.tier_name(p.get("tier")) if p.get("tier") else "",
+                         bg=SURFACE, fg=MUTED, font=(app.UI, 8)).pack(side="right", padx=(12, 0))
+        bar = tk.Frame(self.body, bg=SURFACE)
+        bar.pack(fill="x", pady=(6, 0))
+        if app.queueing():
+            e = int(queue_elapsed(live))
+            b = app.button(bar, f"Stop queue  {e // 60}:{e % 60:02d}", CARD_HI,
+                           lambda: app.party_do("leave"))
+        else:
+            b = app.button(bar, "Start queue", ACCENT, lambda: app.party_do("join"))
+        b.config(font=(app.UI, 8, "bold"), padx=10, pady=4)
+        b.pack(side="left")
+        op = bool(live.get("party_open"))
+        o = app.button(bar, "Open" if op else "Closed", CARD,
+                       lambda: app.party_do("access", not op))
+        o.config(font=(app.UI, 8, "bold"), padx=10, pady=4)
+        o.pack(side="left", padx=(6, 0))
 
 
 def _user32():
@@ -6110,6 +6471,12 @@ class App(tk.Tk):
         from collections import OrderedDict
         self._shapes = OrderedDict()
         self.page_t = 0
+        self.kbd_focus = False
+        self.mouse = (0, 0)
+        self.tab_t = 0
+        self.page_dir = 1
+        self._tab_mark = None
+        self._bar_i = 0
         self.glow_cur = GLOW
         self._more = self._shimmer = False
         self._ovl_more = self._ovl_loop = False
@@ -6256,13 +6623,33 @@ class App(tk.Tk):
     def is_hidden(self):
         return self.state() == "withdrawn"
 
+    def play_ui(self, name):
+        """Optional, very quiet interface sounds (Settings > Appearance, off by default)."""
+        if not self.settings.get("ui_sounds"):
+            return
+        now = time.time()
+        if now - getattr(self, "_snd_t", 0) < 0.05:
+            return
+        self._snd_t = now
+        threading.Thread(target=play_ui_sound, args=(name,), daemon=True).start()
+
     def toast(self, msg, kind="info", tray=True):
         if kind == "bad":
             self.log(msg)
+        if kind in ("good", "wish"):
+            self.play_ui("success")
+        elif kind == "bad":
+            self.play_ui("error")
         self.status, self.status_until = msg, time.time() + 6
-        self.toasts.append({"msg": msg, "kind": kind, "t": time.time()})
+        for t in self.toasts:            # the same message again just refreshes its timer
+            if t["msg"] == msg and not t.get("gone"):
+                t["t"] = max(t["t"], time.time() - 0.3)
+                self.draw_overlays()
+                return
+        self._toast_id = getattr(self, "_toast_id", 0) + 1
+        self.toasts.append({"msg": msg, "kind": kind, "t": time.time(), "id": self._toast_id})
         self.toasts = self.toasts[-4:]
-        self.after(5200, self.redraw)
+        self.after(5600, self.redraw)
         self.redraw()
         if tray and self.tray and self.is_hidden() and kind in ("good", "bad", "wish"):
             try:
@@ -6361,19 +6748,55 @@ class App(tk.Tk):
     def measure(self, s, size=10, weight="normal"):
         return self.fobj(size, weight).measure(s)
 
-    def shape_img(self, w, h, r, fill, outline, width):
-        """Anti-aliased rounded rectangle as a cached image (Tk polygons are jagged)."""
-        key = (w, h, round(r, 1), fill, outline, width)
+    def shape_img(self, w, h, r, fill, outline, width, depth=0.0, alpha=1.0):
+        """Anti-aliased rounded rectangle as a cached image (Tk polygons are jagged).
+        depth > 0 lights it from above: the fill brightens slightly towards the top and the
+        top edge of the border catches the light, which reads as a raised surface."""
+        depth = round(depth, 2)
+        alpha = round(alpha, 2)
+        key = (w, h, round(r, 1), fill, outline, width, depth, alpha)
         im = self._shapes.get(key)
         if im is not None:
             self._shapes.move_to_end(key)
             return im
         s_ = 3
-        big = Image.new("RGBA", (w * s_, h * s_), (0, 0, 0, 0))
-        d = ImageDraw.Draw(big)
+        W, H = w * s_, h * s_
         rr = max(0, min(r, w / 2, h / 2)) * s_
-        d.rounded_rectangle((0, 0, w * s_ - 1, h * s_ - 1), rr, fill=fill or None,
-                            outline=outline or None, width=max(1, int(width * s_)) if outline else 0)
+        bw = max(1, int(width * s_)) if outline else 0
+        if not depth:
+            big = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            ImageDraw.Draw(big).rounded_rectangle((0, 0, W - 1, H - 1), rr, fill=fill or None,
+                                                  outline=outline or None, width=bw)
+        else:
+            big = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            mask = Image.new("L", (W, H), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, W - 1, H - 1), rr, fill=255)
+            if fill:
+                top = mix(fill, "#ffffff", 0.028 * depth)
+                bot = mix(fill, "#000000", 0.06 * depth)
+                big.paste(_vgrad(W, H, top, bot), (0, 0), mask)
+                # a whisper of light just inside the top edge
+                gl = Image.new("L", (W, H), 0)
+                ImageDraw.Draw(gl).rounded_rectangle((0, 0, W - 1, min(H - 1, int(H * 0.5))), rr,
+                                                     fill=int(7 * depth))
+                from PIL import ImageFilter as _IF
+                gl = ImageChops.multiply(gl.filter(_IF.GaussianBlur(max(2, H * 0.12))), mask)
+                big = Image.composite(Image.new("RGBA", (W, H), (255, 255, 255, 255)), big,
+                                      gl) if fill else big
+                big.putalpha(ImageChops.multiply(big.getchannel("A"), mask))
+            edge = outline or (mix(fill, "#ffffff", 0.10) if fill else None)
+            if edge:
+                ring = Image.new("L", (W, H), 0)
+                ImageDraw.Draw(ring).rounded_rectangle((0, 0, W - 1, H - 1), rr, outline=255,
+                                                       width=bw or s_)
+                hi = mix(edge, "#ffffff", 0.13 * depth)
+                lo = edge if outline else mix(fill, "#000000", 0.0)
+                col = _vgrad(W, H, hi, lo, 0.55)
+                if not outline:   # borderless: only the lit top edge shows, fading out
+                    ring = ImageChops.multiply(ring, _vgrad_l(W, H, 150, 0, 0.45))
+                big = Image.composite(col, big, ring)
+        if alpha < 1:
+            big.putalpha(big.getchannel("A").point(lambda v: int(v * alpha)))
         im = ImageTk.PhotoImage(big.resize((w, h), Image.LANCZOS))
         self._shapes[key] = im
         if len(self._shapes) > 5000:
@@ -6390,12 +6813,18 @@ class App(tk.Tk):
             fill, out = kw.get("fill", ""), kw.get("outline", "")
             if not fill and not out:
                 return None
+            depth = kw.get("depth")
+            if depth is None:     # bordered panels get gentle depth everywhere by default
+                depth = 1.0 if (out and fill and H >= 34 and W >= 60) else 0.0
             try:
-                img = self.shape_img(W, H, r, fill, out, kw.get("width", 1))
+                img = self.shape_img(W, H, r, fill, out, kw.get("width", 1), depth,
+                                     kw.get("alpha", 1.0))
                 return self.cv.create_image(X1, Y1, image=img, anchor="nw",
                                             tags=kw.get("tags", ()))
             except Exception:
                 pass
+        kw.pop("depth", None)
+        kw.pop("alpha", None)
         r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
         pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
                x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
@@ -6445,6 +6874,45 @@ class App(tk.Tk):
         return self.cv.create_text(x, y, text=s, font=(self.UI, size, weight),
                                    fill=fill or TEXT, **kw)
 
+    def toggle_switch(self, x, cy, on, key, tags=(), enabled=True, w=42, h=24):
+        """Toggle switch: the knob glides over with a tiny overshoot, squishes while pressed
+        and the track lights up when on."""
+        t = self.tween("tog:" + key, 1.0 if on else 0.0, 0.3, "back")
+        tq = round(max(0.0, min(1.0, t)) * 10) / 10
+        pr = self.pressed(key) if enabled else 0
+        f = self.hv(key) if enabled else 0
+        y0, y1 = cy - h / 2, cy + h / 2
+        if tq > 0 and enabled:
+            self.soft(x, y0, x + w, y1, h / 2, ACCENT, alpha=int(70 * tq), spread=7, dy=1,
+                      tags=tags)
+        off_col = mix(mix(CARD_HI, BG, 0.15), CARD_HI, 0.5 * f)
+        track = mix(off_col, ACCENT, tq) if enabled else mix(CARD, SURFACE, 0.4)
+        self.rrect(x, y0, x + w, y1, h / 2, fill=track, depth=0.8,
+                   outline=mix(mix(LINE, "#ffffff", 0.06), ACCENT_HI, tq) if enabled else LINE,
+                   tags=tags)
+        kr = h / 2 - 3
+        kw = 2 * kr + 5 * pr                       # squish while held
+        kx = x + 3 + (w - 6 - kw) * max(-0.05, min(1.05, t))
+        self.soft(kx, cy - kr, kx + kw, cy + kr, kr, "#000000", alpha=110, spread=4, dy=2,
+                  tags=tags)
+        knob = mix(mix(MUTED, "#ffffff", 0.3), "#ffffff", tq) if enabled else DIM
+        self.rrect(kx, cy - kr, kx + kw, cy + kr, kr, fill=knob, depth=1.0, tags=tags)
+        return w
+
+    def hover_bg(self, x1, y1, x2, y2, r, key, base=None, hot=None, tags=()):
+        """Hover highlight for a row that sits inside a panel. Nothing is drawn at rest (so
+        the panel's own shading shows through) and the row stays clickable via its box."""
+        self.hit_boxes.append(((x1, y1, x2, y2), key))
+        f = self.hv(key)
+        pr = self.pressed(key)
+        if f <= 0 and not pr:
+            return
+        hot = hot or CARD
+        col = mix(base or SURFACE, hot, f)
+        if pr:
+            col = mix(col, mix(hot, "#000000", 0.2), 0.5 * pr)
+        self.rrect(x1, y1, x2, y2, r, fill=col, tags=tags, depth=0)
+
     def pill(self, x, y, label, fill=None, fg=None, size=8, tags=(), anchor="w", outline=""):
         w = self.measure(label, size, "bold") + 16
         if anchor == "e":
@@ -6465,6 +6933,7 @@ class App(tk.Tk):
         if HAS_PIL and not kw.get("dash") and r >= 2:
             return self.rrect(x - r, y - r, x + r, y + r, r, **kw)
         kw.setdefault("outline", "")
+        kw.pop("depth", None)
         return self.cv.create_oval(x - r, y - r, x + r, y + r, **kw)
 
     def image(self, url, x, y, w, h, anchor="nw", tags=(), **kw):
@@ -6473,11 +6942,73 @@ class App(tk.Tk):
             self.cv.create_image(x, y, image=im, anchor=anchor, tags=tags)
         elif self.images and url and url in self.images.pending:
             x0, y0 = (x - w / 2, y - h / 2) if anchor == "center" else (x, y)
-            ph = (math.sin(time.time() * 5 - x0 / 110) + 1) / 2
-            self.rrect(x0, y0, x0 + w, y0 + h, min(12, kw.get("radius") or 8),
-                       fill=mix(CARD, CARD_HI, 0.2 + ph * 0.7), tags=tags)
-            self._shimmer = True
+            self.skel(x0, y0, x0 + w, y0 + h, min(12, kw.get("radius") or 8), tags=tags)
         return im
+
+    def empty_state(self, x0, x1, y, icon, title, sub="", action=None, tone=None, h=None):
+        """The one look for 'nothing here yet' and 'couldn't load' states: an icon in a soft
+        glowing well, a title, a line of explanation and an optional button.
+        action = (label, fn, key, icon). Returns the bottom y."""
+        col = tone or ACCENT
+        bw = x1 - x0
+        lines = 1 + int(self.measure(sub, 10) // max(1, min(560, bw - 80))) if sub else 0
+        h = h or (150 + 18 * max(0, lines - 1) + (52 if action else 0))
+        self.rrect(x0, y, x1, y + h, 18, fill=SURFACE, outline=LINE)
+        cx = (x0 + x1) / 2
+        iy = y + 44
+        self.soft(cx - 24, iy - 24, cx + 24, iy + 24, 24, col, alpha=80, spread=12, dy=0)
+        self.circle(cx, iy, 24, fill=mix(SURFACE, col, 0.18), depth=1.0)
+        self.icon(cx, iy, icon, 13, mix(col, "#ffffff", 0.35))
+        self.text(cx, y + 90, title, 13, "bold", anchor="center", maxw=bw - 40)
+        if sub:
+            self.cv.create_text(cx, y + 112, text=sub, width=min(560, bw - 80), anchor="n",
+                                justify="center", font=(self.UI, 10), fill=MUTED)
+        if action:
+            lab, fn, key, ic = (tuple(action) + (None,))[:4]
+            bwid = self.measure(lab, 10, "bold") + (48 if ic else 30)
+            self.action_button(cx - bwid / 2, y + h - 54, lab, fn, key, ic)
+        return y + h
+
+    # ---- skeletons: shaped placeholders that shimmer while content loads
+    def skel(self, x0, y0, x1, y1, r=8, phase=0.0, tags=()):
+        """One shimmering placeholder block. A soft highlight sweeps left to right across
+        every skeleton on screen together, so loading looks calm and deliberate."""
+        t = time.time()
+        sweep = ((t * 0.5) % 1.6) - 0.3                # -0.3 .. 1.3 across the window
+        w = max(1.0, self.cv.winfo_width())
+        d = abs((x0 + x1) / 2 / w - sweep)
+        glow = max(0.0, 1 - d / 0.28) ** 2
+        base = mix(SURFACE, CARD, 0.55 + 0.1 * math.sin(t * 2.2 + phase))
+        col = mix(base, mix(CARD_HI, SOFT, 0.08), round(glow * 6) / 6 * 0.85)
+        self.rrect(x0, y0, x1, y1, r, fill=col, depth=0, tags=tags)
+        self._shimmer = True      # light refresh rate: loading shouldn't cost CPU
+
+    def skeleton_rows(self, x0, x1, y, n=4, row_h=58, avatar=True, panel=True):
+        """A list's worth of skeleton rows (avatar + two lines). Returns the bottom y."""
+        if panel:
+            self.rrect(x0, y, x1, y + n * row_h + 12, 16, fill=SURFACE, outline=LINE)
+        for i in range(n):
+            ry = y + 6 + i * row_h
+            lx = x0 + 18
+            if avatar:
+                self.skel(lx, ry + 10, lx + 38, ry + 48, 19, i)
+                lx += 54
+            wide = (x1 - lx) * (0.42 - 0.06 * (i % 3))
+            self.skel(lx, ry + 16, lx + wide, ry + 27, 5, i)
+            self.skel(lx, ry + 35, lx + wide * 0.6, ry + 44, 4, i + 0.5)
+            self.skel(x1 - 110, ry + 22, x1 - 22, ry + 36, 7, i + 1)
+        return y + n * row_h + 12
+
+    def skeleton_cards(self, x0, x1, y, n=3, h=140, cols=3, gap=14):
+        cw = (x1 - x0 - gap * (cols - 1)) / cols
+        for i in range(n):
+            cx = x0 + (i % cols) * (cw + gap)
+            cy = y + (i // cols) * (h + gap)
+            self.rrect(cx, cy, cx + cw, cy + h, 16, fill=SURFACE, outline=LINE)
+            self.skel(cx + 16, cy + 16, cx + cw - 16, cy + h * 0.5, 10, i)
+            self.skel(cx + 16, cy + h * 0.5 + 14, cx + cw * 0.6, cy + h * 0.5 + 26, 5, i)
+            self.skel(cx + 16, cy + h * 0.5 + 34, cx + cw * 0.4, cy + h * 0.5 + 44, 4, i)
+        return y + ((n - 1) // cols + 1) * (h + gap)
 
     def avatar_img(self, size, radius, col):
         key = ("av", size, round(radius), col)
@@ -6544,10 +7075,21 @@ class App(tk.Tk):
             return "Unranked"
         return f"{ASSETS.tier_name(m['tier'])} · {m.get('rr', 0)} RR"
 
-    def bar(self, x, y, w, frac, h=8, color=None, bg=None):
+    def bar(self, x, y, w, frac, h=8, color=None, bg=None, key=None):
+        """Progress bar. Fills in from empty when its page opens and glides when the value
+        changes; bars are told apart by draw order unless they pass a key."""
+        self._bar_i = getattr(self, "_bar_i", 0) + 1
+        k = "bar:" + (key or f"{self.page}:{self._bar_i}")
+        frac = max(0.0, min(1.0, float(frac or 0)))
+        f = self.tween_from(k, 0.0, frac, 0.75, "quint", delay=min(0.35, 0.03 * self._bar_i))
         self.rrect(x, y, x + w, y + h, h / 2, fill=bg or CARD)
-        if frac > 0:
-            self.rrect(x, y, x + max(h, w * min(1, frac)), y + h, h / 2, fill=color or ACCENT)
+        if f > 0.002:
+            col = color or ACCENT
+            fw = max(h, w * f)
+            self.rrect(x, y, x + fw, y + h, h / 2, fill=col)
+            if h >= 6 and fw > h * 2:     # soft highlight along the top of the fill
+                self.rrect(x + h / 2, y + 1, x + fw - h / 2, y + max(2, h * 0.38), h * 0.2,
+                           fill=mix(col, "#ffffff", 0.22))
 
     def section(self, x, y, icon, title, extra=None):
         self.icon(x + 8, y + 12, icon, 12, SOFT)
@@ -6565,7 +7107,10 @@ class App(tk.Tk):
                       maxw=x2 - x1 - 50)
 
     # ---- motion: tiny tween engine on top of the redraw loop
-    def tween(self, key, target, dur=0.22):
+    # Every animated value in the app goes through tween(): one place decides the curves,
+    # one place keeps frames coming while anything moves, and turning Animations off in
+    # Settings snaps everything to its final state.
+    def tween(self, key, target, dur=0.22, ease="out", delay=0.0):
         """Eased value that glides to `target`. Keeps frames coming while it moves."""
         if not self.settings.get("animations", True):
             self._tw.pop(key, None)
@@ -6573,35 +7118,65 @@ class App(tk.Tk):
         now = time.time()
         st = self._tw.get(key)
         if st is None:
-            self._tw[key] = (target, target, now, dur)
+            self._tw[key] = (target, target, now, dur, ease)
             return target
-        frm, to, t0, d = st
-        k = min(1.0, (now - t0) / d) if d else 1.0
-        cur = frm + (to - frm) * (1 - (1 - k) ** 3)
+        frm, to, t0, d, ez = st if len(st) == 5 else st + ("out",)
+        k = min(1.0, max(0.0, (now - t0) / d)) if d else 1.0
+        cur = frm + (to - frm) * EASES.get(ez, ease_out)(k)
         if to != target:
-            self._tw[key] = (cur, target, now, dur)
+            self._tw[key] = (cur, target, now + delay, dur, ease)
             self._more = True
             return cur
         if k < 1:
             self._more = True
         return cur
 
+    def tween_from(self, key, start, target, dur=0.5, ease="quint", delay=0.0):
+        """Start a tween at `start` (if it isn't running yet) and glide to `target`."""
+        if key not in self._tw and self.settings.get("animations", True):
+            self._tw[key] = (start, target, time.time() + delay, dur, ease)
+            self._more = True
+        return self.tween(key, target, dur, ease)
+
+    def reset_anims(self, *prefixes):
+        """Forget tweens so the next draw replays their entrance (counters, bars...)."""
+        self._tw = {k: v for k, v in self._tw.items() if not k.startswith(prefixes)}
+
     def hv(self, key, on=None):
         """0..1 hover amount for `key`, eased in/out (quantised so shapes stay cached)."""
         on = (self.hover == key) if on is None else bool(on)
-        v = self.tween("hv:" + str(key), 1.0 if on else 0.0, 0.16 if on else 0.24)
+        v = self.tween("hv:" + str(key), 1.0 if on else 0.0, 0.14 if on else 0.26)
         return round(v * 8) / 8
+
+    def pressed(self, key):
+        """0..1 'pushed in' amount: snaps down fast on press, eases back on release."""
+        down = bool(self.press) and self.press[0] == key and self.hover == key
+        v = self.tween("pr:" + str(key), 1.0 if down else 0.0, 0.06 if down else 0.22)
+        return round(v * 4) / 4
 
     def hcol(self, key, base, hot, on=None):
         f = self.hv(key, on)
-        if f <= 0:
+        pr = self.pressed(key) if self.press else (
+            self.pressed(key) if ("pr:" + str(key)) in self._tw else 0)
+        if f <= 0 and not pr:
             return base
-        if f >= 1:
-            return hot
         if not (isinstance(base, str) and isinstance(hot, str) and base.startswith("#")
                 and hot.startswith("#")):
             return hot if f >= 0.5 else base
-        return mix(base, hot, f)
+        col = hot if f >= 1 else mix(base, hot, f)
+        if pr:
+            col = mix(col, mix(base, "#000000", 0.25), 0.55 * pr)   # pressed: a touch deeper
+        return col
+
+    def count(self, key, value, dur=0.9):
+        """Number that counts up to `value` the first time it's shown on a page visit,
+        then glides between values when it changes."""
+        try:
+            v = float(value or 0)
+        except (TypeError, ValueError):
+            return value
+        cur = self.tween_from("cnt:" + key, 0.0, v, dur, "quint")
+        return int(round(cur)) if float(v).is_integer() else cur
 
     def chips(self, x, y, options, current, on_pick, key, size=10, h=32):
         """Row of selectable pills; the selected one slides between options."""
@@ -6619,9 +7194,11 @@ class App(tk.Tk):
                 self.rrect(px, y, px + tw, y + h, h / 2,
                            fill=self.hcol(k, CARD, CARD_HI), tags=tags)
         if sel:
-            sx = self.tween(f"chip:{key}:x", sel[0] - x, 0.26) + x
-            sw = self.tween(f"chip:{key}:w", sel[1], 0.26)
-            self.rrect(sx, y, sx + sw, y + h, h / 2, fill=ACCENT)
+            sx = self.tween(f"chip:{key}:x", sel[0] - x, 0.34, "back") + x
+            sw = self.tween(f"chip:{key}:w", sel[1], 0.34, "back")
+            if h >= 26:
+                self.soft(sx, y, sx + sw, y + h, h / 2, ACCENT, alpha=70, spread=8, dy=2)
+            self.rrect(sx, y, sx + sw, y + h, h / 2, fill=ACCENT, depth=1.0)
         for value, label, px, tw in pos:
             k = f"{key}:{value}"
             on = value == current
@@ -6637,16 +7214,26 @@ class App(tk.Tk):
             x -= w
         hov = self.hover == key and not disabled
         tags = self.hit(key, click=None if disabled else fn, tip=tip)
+        f = 0 if disabled else self.hv(key, hov)
+        pr = 0 if disabled else self.pressed(key)
         if primary:
-            fill = DIM if disabled else (self.hcol(key, ACCENT, ACCENT_HI, hov))
+            fill = mix(DIM, CARD, 0.4) if disabled else self.hcol(key, ACCENT, ACCENT_HI, hov)
+            if f > 0 and not pr:
+                self.soft(x, y, x + w, y + h, h / 2, ACCENT, alpha=int(110 * f), spread=10,
+                          dy=3, tags=tags)
         else:
-            fill = self.hcol(key, CARD, CARD_HI, hov)
-        self.rrect(x, y, x + w, y + h, h / 2, fill=fill, tags=tags)
+            fill = mix(CARD, SURFACE, 0.5) if disabled else self.hcol(key, CARD, CARD_HI, hov)
+        ins = 1.5 * pr                      # pressed: sinks a hair and tightens
+        self.rrect(x + ins, y + ins, x + w - ins, y + h - ins + 0.5 * pr, h / 2, fill=fill,
+                   tags=tags, depth=0 if disabled else (1.0 - 0.6 * pr),
+                   outline="" if primary or disabled else mix(LINE, CARD_HI, f))
+        dy = 0.5 * pr
+        fg = DIM if disabled else (TEXT if primary else self.hcol(key, SOFT, TEXT, hov))
         tx = x + 15
         if icon:
-            self.icon(tx + 6, y + h / 2, icon, 10, TEXT, tags=tags)
+            self.icon(tx + 6, y + h / 2 + dy, icon, 10, fg, tags=tags)
             tx += 20
-        self.text(tx, y + h / 2, label, 10, "bold", TEXT if primary or hov else SOFT, tags=tags)
+        self.text(tx, y + h / 2 + dy, label, 10, "bold", fg, tags=tags)
         return w
 
     # ------------------------------------------------------------ main draw
@@ -6675,7 +7262,8 @@ class App(tk.Tk):
         self.advance_scroll()
         if len(self._tw) > 1500:
             now_ = time.time()
-            self._tw = {k: v for k, v in self._tw.items() if now_ - v[2] < v[3] + 0.5}
+            self._tw = {k: v for k, v in self._tw.items()
+                        if now_ - v[2] < v[3] + 0.5 or k.startswith(("cnt:", "bar:"))}
         target = self.glow_target()
         if anim and self.glow_cur != target:
             nxt = mix(self.glow_cur, target, 0.18)
@@ -6712,25 +7300,99 @@ class App(tk.Tk):
             self.text(x0 + 24, 134, "Everything else still works. Settings > Export diagnostics "
                                     "and send the zip so it can be fixed.", 9, fill=MUTED,
                       maxw=x1 - x0 - 48)
-        p_age = time.time() - self.page_t
-        if anim and p_age < 0.3:
-            e = 1 - (1 - p_age / 0.3) ** 4
-            dy = (1 - e) * 22
-            for item in c.find_all():
-                if item > marker:
-                    c.move(item, 0, dy)
-            self._more = True
+        self.draw_transition(marker, w, h, anim)
+        self._bar_i = 0
         if self.dragging:
             self.draw_drag_ghost()
         self.draw_sidebar(w, h)
         self.draw_bottom(w, h)
+        self._hb_base = len(self.hit_boxes)
         self.draw_overlays()
         if had_focus and self.search_shown:
             self.search.focus_set()
         if self._more:
             self.after(16, self.redraw)
         elif self._shimmer:
-            self.after(90, self.redraw)
+            self.after(60, self.redraw)
+        bg = getattr(self, "_bg_pil", None)
+        if bg is not None and getattr(self, "_fade_ident", None) != (id(bg), w, h) and \
+                not getattr(self, "_warm_job", None):
+            self._warm_job = self.after(400, self._warm_fades)
+
+    # ---- page & tab transitions: content glides in while the background fades it up
+    PAGE_T, TAB_T = 0.34, 0.26
+
+    def draw_transition(self, marker, w, h, anim):
+        if not anim:
+            return
+        now = time.time()
+        c = self.cv
+        if now - self.page_t < self.PAGE_T:
+            age, dur, mk, y0, dist = now - self.page_t, self.PAGE_T, marker, 0, 16
+        elif now - self.tab_t < self.TAB_T and self._tab_mark and self._tab_mark[2] == self.page:
+            age, dur, (mk, y0, _) = now - self.tab_t, self.TAB_T, self._tab_mark
+            dist = 10
+        else:
+            return
+        self._more = True
+        k = ease_out_quint(age / dur)
+        dy = round((1 - k) * dist * self.page_dir, 1)
+        if abs(dy) >= 0.5:
+            for item in c.find_all():
+                if item > mk:
+                    c.move(item, 0, dy)
+        if y0 > 0:
+            return      # tabs just glide; only whole pages fade (keeps memory down)
+        fade = 1 - ease_out(age / (dur * 0.85))
+        ph = self.fade_photo(w, h, fade)
+        if ph:
+            c.create_image(self.SIDE + 1, 0, image=ph, anchor="nw")
+
+    FADE_LEVELS = 4
+
+    def fade_photo(self, w, h, level, build=True):
+        """The window background at `level` opacity, laid over a new page to fade it in (Tk
+        can't fade canvas items, but it does blend images). Only the current background's
+        few levels are kept, and they're built ahead of time while the app is idle."""
+        bg = getattr(self, "_bg_pil", None)
+        n = round(level * self.FADE_LEVELS)
+        if not HAS_PIL or bg is None or n <= 0 or bg.size != (w, h):
+            return None
+        ident = (id(bg), w, h)
+        if getattr(self, "_fade_ident", None) != ident:
+            self._fade_ident, self._fades = ident, {}
+        ph = self._fades.get(n)
+        if ph is None and build:
+            crop = bg.crop((self.SIDE + 1, 0, w, h - self.BOTTOM)).convert("RGBA")
+            crop.putalpha(int(255 * n / self.FADE_LEVELS))
+            ph = self._fades[n] = ImageTk.PhotoImage(crop)
+        return ph
+
+    def _warm_fades(self):
+        """Build the next missing fade level during idle time, one per call."""
+        self._warm_job = None
+        if not self.settings.get("animations", True) or not HAS_PIL:
+            return
+        if self._more:                              # busy animating: try again shortly
+            self._warm_job = self.after(250, self._warm_fades)
+            return
+        w, h = max(self.cv.winfo_width(), 400), max(self.cv.winfo_height(), 300)
+        for n in range(1, self.FADE_LEVELS + 1):
+            if self.fade_photo(w, h, n / self.FADE_LEVELS, build=False) is None:
+                self.fade_photo(w, h, n / self.FADE_LEVELS)
+                self._warm_job = self.after(60, self._warm_fades)
+                return
+
+    def mark_tab_content(self, y):
+        """Pages call this right under their tab bar so a tab switch only animates what
+        changed, not the header above it."""
+        self._tab_mark = ((self.cv.find_all() or (0,))[-1], y, self.page)
+
+    def tab_switched(self, direction=1):
+        if self.settings.get("animations", True):
+            self.tab_t = time.time()
+            self.page_dir = 1 if direction >= 0 else -1
+            self.reset_anims("cnt:", "bar:")
 
     def glow_photo(self, w, h, col):
         """Smooth radial glow rendered once per size/colour (no banding, fewer canvas items)."""
@@ -6749,8 +7411,10 @@ class App(tk.Tk):
             mask = grad.point(lambda v: int(242 * max(0.0, min(1.0, (1 - v / 255) / 0.92)) ** 1.7))
             glow = Image.new("RGB", (gw, gh), rgb(col))
             base.paste(glow, (int(sw * 0.58 - gw / 2), int(sh * 0.98 - gh / 2)), mask)
-            ph = ImageTk.PhotoImage(base.resize((w, h), Image.BICUBIC))
+            full = base.resize((w, h), Image.BICUBIC)
+            ph = ImageTk.PhotoImage(full)
             self._bg_cache = (key, ph)
+            self._bg_pil = full
             return ph
         except Exception:
             return None
@@ -6837,11 +7501,14 @@ class App(tk.Tk):
             self.search.focus_set()
 
     def page_header(self, x0, x1, y, icon, title, sub=None):
-        self.icon(x0 + 10, y + 16, icon, 15, SOFT)
-        self.text(x0 + 32, y + 16, title, 20, "bold")
+        self.soft(x0, y, x0 + 32, y + 32, 10, ACCENT, alpha=55, spread=8, dy=1)
+        self.rrect(x0, y, x0 + 32, y + 32, 10, fill=mix(CARD, ACCENT, 0.22), depth=1.0,
+                   outline=mix(LINE, ACCENT, 0.35))
+        self.icon(x0 + 16, y + 16, icon, 12, mix(SOFT, "#ffffff", 0.3))
+        self.text(x0 + 44, y + 16, title, 20, "bold")
         if sub:
-            self.text(x0 + 40 + self.measure(title, 20, "bold"), y + 18, sub, 10, fill=DIM,
-                      maxw=x1 - x0 - 400)
+            self.text(x0 + 54 + self.measure(title, 20, "bold"), y + 18, sub, 10, fill=DIM,
+                      maxw=x1 - x0 - 420)
 
     # ------------------------------------------------------------ in-app sheets
     def sheet_push(self, sh):
@@ -6951,8 +7618,8 @@ class App(tk.Tk):
         from PIL import ImageFilter
         W, H = w + 2 * (P + SH), h + 2 * (P + SH)
         a = Image.new("L", (W, H), 0)
-        ImageDraw.Draw(a).rounded_rectangle((SH, SH + 10, W - SH, H - SH + 10), R, fill=150)
-        a = a.filter(ImageFilter.GaussianBlur(SH / 2.2))
+        ImageDraw.Draw(a).rounded_rectangle((SH, SH + 12, W - SH, H - SH + 12), R, fill=175)
+        a = a.filter(ImageFilter.GaussianBlur(SH / 2.0))
         im = Image.merge("RGBA", (Image.new("L", (W, H), 0),) * 3 + (a,))
         ss = 3
         big = Image.new("RGBA", (W * ss, H * ss), (0, 0, 0, 0))
@@ -6960,6 +7627,17 @@ class App(tk.Tk):
             (SH * ss, SH * ss, (W - SH) * ss - 1, (H - SH) * ss - 1), R * ss,
             fill=_rgb(SURFACE) + (255,), outline=_rgb(mix(LINE, "#ffffff", 0.08)) + (255,),
             width=ss)
+        # light catching the top edge of the panel
+        fade = Image.new("L", (1, H * ss), 0)
+        top_px = SH * ss
+        fade.putdata([max(0, 120 - int(120 * max(0, y - top_px) / (H * ss * 0.35)))
+                      for y in range(H * ss)])
+        edge = Image.new("L", (W * ss, H * ss), 0)
+        ImageDraw.Draw(edge).rounded_rectangle(
+            (SH * ss, SH * ss, (W - SH) * ss - 1, (H - SH) * ss - 1), R * ss, outline=255,
+            width=ss)
+        edge = ImageChops.multiply(edge, fade.resize((W * ss, H * ss)))
+        big = Image.composite(Image.new("RGBA", big.size, (255, 255, 255, 255)), big, edge)
         im = Image.alpha_composite(im, big.resize((W, H), Image.LANCZOS))
         if len(cache) > 24:
             cache.clear()
@@ -7035,6 +7713,7 @@ class App(tk.Tk):
 
     def close_pop(self):
         if self.pop:
+            self._pop_closing = dict(self.pop, tc=time.time())
             self.pop = None
             self.redraw()
 
@@ -7054,6 +7733,8 @@ class App(tk.Tk):
 
     def _pop_run(self, i):
         it = self.pop["items"][i] if self.pop else None
+        if self.pop:
+            self._pop_closing = dict(self.pop, tc=time.time(), picked=i)
         self.pop = None
         self.redraw()
         if it and it.get("fn") and not it.get("disabled"):
@@ -7061,8 +7742,14 @@ class App(tk.Tk):
 
     def draw_pop(self, w, h):
         p = self.pop
+        closing = False
         if not p:
-            return
+            p = getattr(self, "_pop_closing", None)
+            if not p or not self.settings.get("animations", True) or \
+                    time.time() - p["tc"] > 0.13:
+                self._pop_closing = None
+                return
+            closing = True
         items = p["items"]
         RH, SEP, PADV = 34, 11, 7
         width = 230
@@ -7084,16 +7771,19 @@ class App(tk.Tk):
         x = max(8, min(x, w - width - 8))
         y = max(8, min(y, h - height - 8))
         anim = self.settings.get("animations", True)
-        k = ease_out((time.time() - p["t0"]) / 0.16) if anim else 1
+        k = ease_out((time.time() - p["t0"]) / 0.17) if anim else 1
+        if closing:
+            k = min(k, 1 - ease_in_out((time.time() - p["tc"]) / 0.13))
+            self._ovl_more = True
         if k < 1:
             self._ovl_more = True
         dy = (1 - k) * (8 if "s" in p["anchor"] else -8)
         y += dy
         base = mix(BG, SURFACE, 0.4)
         fill = mix(base, mix(SURFACE, CARD, 0.5), 0.35 + 0.65 * k)
-        self.soft(x, y, x + width, y + height, 14, "#000000", int(140 * round(k * 4) / 4), 18, 8)
+        self.soft(x, y, x + width, y + height, 14, "#000000", int(150 * round(k * 4) / 4), 18, 9)
         self.rrect(x, y, x + width, y + height, 14, fill=fill,
-                   outline=mix(fill, mix(LINE, "#ffffff", 0.1), k))
+                   outline=mix(fill, mix(LINE, "#ffffff", 0.1), k), depth=k)
         cy = y + PADV
         for i, it in enumerate(items):
             if not it:
@@ -7103,14 +7793,19 @@ class App(tk.Tk):
                 continue
             key = f"pop:{i}"
             dis = it.get("disabled")
-            tags = self.hit(key, click=(lambda i=i: self._pop_run(i)) if not dis else None)
-            hov = (self.hover == key or p["sel"] == i) and not dis
-            if hov:
-                hc = mix(DANGER, fill, 0.72) if it.get("danger") else mix(ACCENT, fill, 0.55)
-                self.rrect(x + 5, cy + 1, x + width - 5, cy + RH - 1, 9, fill=hc, tags=tags)
+            if closing:
+                tags = ()
+                hov = p.get("picked") == i
             else:
-                self.cv.create_rectangle(x + 5, cy + 1, x + width - 5, cy + RH - 1, fill="",
-                                         outline="", tags=tags)
+                tags = self.hit(key, click=(lambda i=i: self._pop_run(i)) if not dis else None,
+                                box=(x + 5, cy, x + width - 5, cy + RH))
+                hov = (self.hover == key or p["sel"] == i) and not dis
+            hf = self.tween("pophv:" + key, 1.0 if hov else 0.0, 0.1 if hov else 0.16) if \
+                not closing else (1.0 if hov else 0.0)
+            if hf > 0.05:
+                hc = mix(DANGER, fill, 0.72) if it.get("danger") else mix(ACCENT, fill, 0.55)
+                self.rrect(x + 5, cy + 1, x + width - 5, cy + RH - 1, 9,
+                           fill=mix(fill, hc, round(hf * 6) / 6), tags=tags, depth=0)
             col = DIM if dis else (DANGER if it.get("danger") and not hov else TEXT)
             col = mix(fill, col, k)
             if it.get("check") is not None:
@@ -7126,7 +7821,8 @@ class App(tk.Tk):
                 self.text(x + width - 14, cy + RH / 2, it["hint"], 8,
                           fill=mix(fill, DIM, k), anchor="e", tags=tags)
             cy += RH
-        p["box"] = (x, y, x + width, y + height)
+        if not closing:
+            p["box"] = (x, y, x + width, y + height)
 
     # ------------------------------------------------------------ overlays
     def draw_overlays(self):
@@ -7134,17 +7830,24 @@ class App(tk.Tk):
         animate at ~30 fps without redrawing the whole page."""
         c = self.cv
         c.delete("ovl")
+        base = getattr(self, "_hb_base", None)
+        if base is not None:           # forget the last overlay frame's click areas
+            del self.hit_boxes[base:]
+        else:
+            self._hb_base = len(self.hit_boxes)
         w, h = max(c.winfo_width(), 400), max(c.winfo_height(), 300)
         marker = (c.find_all() or (0,))[-1]
         self._ovl_more = False
         if self.busy or self.fetching or self.league_busy:
             top = h - self.BOTTOM
-            span = w * 0.22
-            pos = (time.time() * 0.55) % 1
+            span = w * 0.26
+            pos = ease_in_out((time.time() * 0.62) % 1)
             xa = -span + pos * (w + span)
-            c.create_line(max(0, xa), top, min(w, xa + span), top, fill=ACCENT, width=3)
-            c.create_line(max(0, xa + span * 0.3), top, min(w, xa + span * 0.7), top,
-                          fill=ACCENT_HI, width=3)
+            self.soft(max(0, xa), top - 1, min(w, xa + span), top + 1, 1, ACCENT, alpha=170,
+                      spread=6, dy=0)
+            c.create_line(max(0, xa), top, min(w, xa + span), top, fill=ACCENT, width=2)
+            c.create_line(max(0, xa + span * 0.25), top, min(w, xa + span * 0.75), top,
+                          fill=ACCENT_HI, width=2)
             self._ovl_more = True
         self.draw_progress(w, h)
         self.draw_toasts(w, h)
@@ -7187,50 +7890,99 @@ class App(tk.Tk):
         x = min(max(8, mx + 14), w - tw - 8)
         y = my + 22 if my + 22 + th < h - 6 else my - th - 12
         y += (1 - a) * 4
-        bg = mix(BG, "#1d1830", a)
+        bg = mix(BG, mix(SURFACE, CARD_HI, 0.55), a)
         self.soft(x, y, x + tw, y + th, 10, alpha=int(150 * a), spread=10, dy=4)
-        self.rrect(x, y, x + tw, y + th, 10, fill=bg, outline=mix(bg, LINE, a))
+        self.rrect(x, y, x + tw, y + th, 10, fill=bg,
+                   outline=mix(bg, mix(LINE, "#ffffff", 0.08), a), depth=a)
         self.cv.create_text(x + 12, y + th / 2, text=tip, anchor="w", width=maxw,
                             font=(self.UI, 9, "bold"), fill=mix(bg, TEXT, a))
 
+    TOAST_LIFE = 5.0
+    TOAST_LOOK = {"good": ("check", "GOOD"), "bad": ("warning", "DANGER"),
+                  "wish": ("star_on", "GOLD"), "info": ("info", "ACCENT")}
+
     def draw_toasts(self, w, h):
+        """Notifications: slide in from the right, stack and glide as others leave, pause
+        while hovered, and dismiss on click. A thin line shows how long each has left."""
         now = time.time()
-        self.toasts = [t for t in self.toasts if now - t["t"] < 5]
-        y = h - self.BOTTOM - 16
+        anim = self.settings.get("animations", True)
+        dt = now - getattr(self, "_toast_last", now)
+        self._toast_last = now
+        life = self.TOAST_LIFE
+        mx, my = getattr(self, "mouse", (-1, -1))
+        live = [t for t in self.toasts if now - t["t"] < life + 0.45]
+        self.toasts = live
+        if not live:
+            return
+        self._ovl_more = True
         x1 = w - 22
-        for t in reversed(self.toasts):
-            col = {"good": GOOD, "bad": DANGER, "wish": GOLD}.get(t["kind"], ACCENT)
-            tw = min(420, self.measure(t["msg"], 10, "bold") + 60)
+        ybase = h - self.BOTTOM - 16
+        stack = 0.0
+        for t in reversed(live):
+            ic, cname = self.TOAST_LOOK.get(t["kind"], self.TOAST_LOOK["info"])
+            col = globals()[cname]
+            tw = min(440, self.measure(t["msg"], 10, "bold") + 78)
+            th = 50
             age = now - t["t"]
-            off = 0
-            if self.settings.get("animations", True):
-                if age < 0.3:
-                    off = (1 - age / 0.3) ** 3 * (tw + 30)
-                elif age > 4.6:
-                    off = ((age - 4.6) / 0.4) ** 2 * (tw + 30)
-                self._ovl_more = True
-            xr = x1 + off
-            self.soft(xr - tw, y - 46, xr, y, 14, alpha=140, spread=12, dy=6)
-            self.rrect(xr - tw, y - 46, xr, y, 14, fill=mix(SURFACE, col, 0.12),
-                       outline=mix(SURFACE, col, 0.55))
-            self.circle(xr - tw + 22, y - 23, 5, fill=col)
-            self.text(xr - tw + 38, y - 23, t["msg"], 10, "bold", maxw=tw - 52)
-            y -= 54
+            # slide/fade in (with a hint of overshoot) and out
+            if not anim:
+                k_in, k_out = 1.0, 0.0
+            else:
+                k_in = ease_out_back(min(1.0, age / 0.42), 0.9)
+                k_out = ease_in_out(max(0.0, (age - life) / 0.42))
+            vis = max(0.0, min(1.0, min(1.0, age / 0.2) * (1 - k_out)))
+            ty_target = stack
+            ty = self.tween(f"toast:y:{t['id']}", ty_target, 0.32, "out") if anim else ty_target
+            stack += (th + 10) * (1 - k_out)
+            xr = x1 + (1 - k_in) * (tw + 40) + k_out * 60
+            yb = ybase - ty
+            x0, y0 = xr - tw, yb - th
+            hov = x0 <= mx <= xr and y0 <= my <= yb
+            if hov and age < life:            # hovering holds it on screen
+                t["t"] += dt
+            key = f"toast:{t['id']}"
+            self.hit(key, click=lambda t=t: t.update(t=time.time() - life), tip=None,
+                     box=(x0, y0, xr, yb))
+            bg = mix(BG, mix(SURFACE, col, 0.1), vis)
+            self.soft(x0, y0, xr, yb, 14, "#000000", alpha=int(150 * vis), spread=14, dy=7)
+            if vis > 0.5:
+                self.soft(x0, y0, xr, yb, 14, col, alpha=int(40 * vis), spread=10, dy=0)
+            self.rrect(x0, y0, xr, yb, 14, fill=bg,
+                       outline=mix(bg, mix(LINE, col, 0.45 + (0.2 if hov else 0)), vis),
+                       depth=1.0)
+            cx, cy = x0 + 26, y0 + th / 2
+            self.circle(cx, cy, 13, fill=mix(bg, mix(SURFACE, col, 0.28), vis), depth=0)
+            self.icon(cx, cy, ic, 9, mix(bg, col, vis))
+            self.text(x0 + 48, cy, t["msg"], 10, "bold", mix(bg, TEXT, vis), maxw=tw - 62)
+            left = max(0.0, 1 - age / life)
+            if left > 0 and vis > 0.3:
+                lw = (tw - 28) * left
+                self.rrect(x0 + 14, yb - 4, x0 + 14 + max(3, lw), yb - 2, 1, depth=0,
+                           fill=mix(bg, col, 0.55 * vis))
 
     def draw_progress(self, w, h):
         p = self.progress
         if not p:
             return
-        pw, ph = 380, 74 + 26 * len(p["steps"])
+        pw, ph = 380, 84 + 26 * len(p["steps"])
         x0 = (self.SIDE + w) / 2 - pw / 2
         y0 = 24
         age = time.time() - p.get("t0", 0)
         if self.settings.get("animations", True) and age < 0.3:
             y0 -= (1 - age / 0.3) ** 3 * (ph + 30)
         self._ovl_more = True
-        col = DANGER if p.get("error") else ACCENT
+        col = DANGER if p.get("error") else (GOOD if p.get("done") else ACCENT)
+        ph = self.tween("prog:h", ph, 0.25)
         self.soft(x0, y0, x0 + pw, y0 + ph, 18, alpha=160, spread=18, dy=10)
-        self.rrect(x0, y0, x0 + pw, y0 + ph, 18, fill=SURFACE, outline=mix(SURFACE, col, 0.5))
+        self.soft(x0, y0, x0 + pw, y0 + ph, 18, col, alpha=45, spread=12, dy=0)
+        self.rrect(x0, y0, x0 + pw, y0 + ph, 18, fill=SURFACE, outline=mix(SURFACE, col, 0.5),
+                   depth=1.0)
+        n = max(1, len(p["steps"]))
+        done_f = 1.0 if p.get("done") else min(1.0, (p["i"] + 0.5) / n)
+        fr = self.tween("prog:f", done_f, 0.5, "quint")
+        if fr > 0:
+            self.rrect(x0 + 18, y0 + ph - 7, x0 + 18 + (pw - 36) * fr, y0 + ph - 4, 1.5, depth=0,
+                       fill=mix(SURFACE, col, 0.85))
         name = p.get("name")
         if name:
             self.account_art(x0 + 18, y0 + 16, 40, name, 10)
@@ -7240,8 +7992,10 @@ class App(tk.Tk):
         y = y0 + 84
         for i, s in enumerate(p["steps"]):
             if i < p["i"] or p.get("done"):
-                self.circle(x0 + 30, y, 8, fill=GOOD)
-                self.icon(x0 + 30, y, "check", 7, BG)
+                pop_ = self.tween_from(f"prog:ok:{id(p)}:{i}", 0.4, 1.0, 0.35, "back")
+                self.circle(x0 + 30, y, 8 * pop_, fill=GOOD)
+                if pop_ > 0.7:
+                    self.icon(x0 + 30, y, "check", 7, BG)
                 fg = MUTED
             elif i == p["i"] and not p.get("error"):
                 self.circle(x0 + 30, y, 8, fill="", outline=mix(SURFACE, ACCENT, 0.45), width=2)
@@ -7286,86 +8040,148 @@ class App(tk.Tk):
         self.call_ui(apply)
 
     # ------------------------------------------------------------ sidebar / bottom
+    def chrome_photo(self, kind, w, h):
+        """Shaded panels for the sidebar and bottom bar (cached per size and theme)."""
+        if not HAS_PIL:
+            return None
+        key = (kind, w, h, BAR, LINE, ACCENT)
+        cache = self.__dict__.setdefault("_chrome", {})
+        if key in cache:
+            return cache[key]
+        if len(cache) > 12:
+            cache.clear()
+        try:
+            if kind == "side":
+                im = _vgrad(w, h, mix(BAR, "#ffffff", 0.018), mix(BAR, "#000000", 0.18))
+                d = ImageDraw.Draw(im)
+                d.line((w - 1, 0, w - 1, h), fill=_rgb(mix(BAR, LINE, 0.75)) + (255,))
+                # a faint accent haze behind the logo
+                haze = Image.new("L", (w, h), 0)
+                ImageDraw.Draw(haze).ellipse((-w * 0.6, -60, w * 1.6, 150), fill=34)
+                haze = haze.filter(ImageFilter.GaussianBlur(28))
+                im = Image.composite(Image.new("RGBA", (w, h), _rgb(ACCENT) + (255,)), im, haze)
+            else:
+                im = _vgrad(w, h, mix(BAR, "#ffffff", 0.025), mix(BAR, "#000000", 0.25))
+                d = ImageDraw.Draw(im)
+                d.line((0, 0, w, 0), fill=_rgb(mix(BAR, LINE, 0.9)) + (255,))
+                glow = Image.new("L", (w, h), 0)
+                ImageDraw.Draw(glow).ellipse((w * 0.32, -h * 0.9, w * 0.68, h * 0.55), fill=26)
+                glow = glow.filter(ImageFilter.GaussianBlur(30))
+                im = Image.composite(Image.new("RGBA", (w, h), _rgb(ACCENT) + (255,)), im, glow)
+                d = ImageDraw.Draw(im)
+                d.line((0, 1, w, 1), fill=_rgb(mix(BAR, "#ffffff", 0.05)) + (255,))
+            cache[key] = ImageTk.PhotoImage(im)
+        except Exception:
+            cache[key] = None
+        return cache[key]
+
+    def side_positions(self, h):
+        """Nav item y positions - spaced to fit, so short windows never overlap Settings."""
+        n = len(self.PAGES)
+        settings_y = h - self.BOTTOM - 40
+        step = max(44, min(58, (settings_y - 70 - 110) / max(1, n - 1)))
+        ys = {p: 110 + i * step for i, (p, _, _) in enumerate(self.PAGES)}
+        ys["settings"] = settings_y
+        return ys
+
     def draw_sidebar(self, w, h):
         S = self.SIDE
-        self.cv.create_rectangle(0, 0, S, h, fill=BAR, outline="")
-        self.cv.create_line(S, 0, S, h - self.BOTTOM, fill=mix(BAR, LINE, 0.6))
+        bg = self.chrome_photo("side", S, h - self.BOTTOM)
+        if bg:
+            self.cv.create_image(0, 0, image=bg, anchor="nw")
+        else:
+            self.cv.create_rectangle(0, 0, S, h, fill=BAR, outline="")
+            self.cv.create_line(S, 0, S, h - self.BOTTOM, fill=mix(BAR, LINE, 0.6))
         logo = self.logo_photo(40)
-        ltags = self.hit("side:logo", click=lambda: self.set_page("home"),
-                         tip=APP_TITLE)
+        lk = "side:logo"
+        ltags = self.hit(lk, click=lambda: self.set_page("home"), tip=APP_TITLE)
+        lf = self.hv(lk)
         if logo:
-            self.soft(S / 2 - 20, 24, S / 2 + 20, 64, 13, ACCENT, 90, 10, 4)
-            self.cv.create_image(S / 2, 42, image=logo, tags=ltags)
+            self.soft(S / 2 - 20, 24, S / 2 + 20, 64, 13, ACCENT, int(90 + 60 * lf), 10, 4)
+            self.cv.create_image(S / 2, 42 - round(1.5 * lf), image=logo, tags=ltags)
         else:
             self.rrect(S / 2 - 20, 22, S / 2 + 20, 62, 13, fill=ACCENT, tags=ltags)
             self.icon(S / 2, 42, "compare", 15, "#ffffff", tags=ltags)
         tip_draw = None
-        y = 110
         hits = self.store_hits()
-        ys = {p: 110 + i * 58 for i, (p, _, _) in enumerate(self.PAGES)}
-        ys["settings"] = h - self.BOTTOM - 40
-        for p_, yy_ in ys.items():   # solid hit areas (Tk ignores clicks inside empty shapes)
-            self.cv.create_rectangle(S / 2 - 22, yy_ - 22, S / 2 + 22, yy_ + 22, fill=BAR,
-                                     outline="", tags=self.hit("side:" + p_,
-                                                               click=lambda p=p_: self.set_page(p)))
+        ys = self.side_positions(h)
+        for p_, yy_ in ys.items():   # hit areas that don't depend on what's drawn on top
+            self.hit_boxes.append(((S / 2 - 24, yy_ - 24, S / 2 + 24, yy_ + 24), "side:" + p_))
+            self.hit("side:" + p_, click=lambda p=p_: self.set_page(p))
         if self.page in ys:
-            ay = self.tween("side:y", ys[self.page], 0.3)
-            self.rrect(S / 2 - 22, ay - 22, S / 2 + 22, ay + 22, 14, fill=CARD_HI)
-            self.rrect(0, ay - 12, 4, ay + 12, 2, fill=ACCENT)
-        for i, (page, ic, tip) in enumerate(self.PAGES):
+            ay = self.tween("side:y", ys[self.page], 0.42, "back")
+            self.soft(S / 2 - 22, ay - 22, S / 2 + 22, ay + 22, 14, ACCENT, alpha=70, spread=10,
+                      dy=2)
+            self.rrect(S / 2 - 22, ay - 22, S / 2 + 22, ay + 22, 14,
+                       fill=mix(CARD_HI, ACCENT, 0.18), depth=1.0)
+            self.soft(0, ay - 12, 4, ay + 12, 2, ACCENT, alpha=170, spread=6, dy=0)
+            self.rrect(0, ay - 12, 4, ay + 12, 2, fill=ACCENT_HI, depth=0)
+        items = [(p, ic, f"{tip}   Ctrl+{i + 1}") for i, (p, ic, tip) in enumerate(self.PAGES)]
+        items.append(("settings", "settings", "Settings"))
+        for page, ic, tip in items:
+            y = ys[page]
             key = "side:" + page
             hov = self.hover == key
             cur = self.page == page
-            tags = self.hit(key, click=lambda p=page: self.set_page(p),
-                            tip=f"{tip}   Ctrl+{i + 1}")
-            if not cur:
-                f = self.hv(key)
-                if f > 0:
-                    self.rrect(S / 2 - 22, y - 22, S / 2 + 22, y + 22, 14,
-                               fill=mix(BAR, CARD, f), tags=tags)
-            self.icon(S / 2, y, ic, 15, TEXT if cur else self.hcol(key, MUTED, TEXT),
-                      tags=tags)
+            tags = self.hit(key, click=lambda p=page: self.set_page(p), tip=tip)
+            f = self.hv(key)
+            pr = self.pressed(key)
+            if not cur and (f > 0 or pr):
+                self.rrect(S / 2 - 22 + pr, y - 22 + pr, S / 2 + 22 - pr, y + 22 - pr, 14,
+                           fill=mix(mix(BAR, CARD, f), SURFACE, 0.4 * pr), depth=0.6 * f,
+                           tags=tags)
+            lift = 0 if cur else round(1.5 * f - pr, 1)
+            self.icon(S / 2, y - lift, ic, 15,
+                      TEXT if cur else self.hcol(key, MUTED, TEXT), tags=tags)
             badge = None
             if page == "home":
                 badge = (str(len(self.accounts())), ACCENT)
             elif page == "store" and hits:
                 badge = (str(len(hits)), GOLD)
+            elif page == "live" and self.queueing():
+                e = int(queue_elapsed(self.live))
+                badge = (f"{e // 60}:{e % 60:02d}", ACCENT_HI)
+                self._more = True
+            elif page == "live" and (self.live or {}).get("phase") in ("pregame", "ingame"):
+                badge = ("●", GOOD)
             if badge:
                 n, col = badge
-                bw = self.measure(n, 8, "bold") + 10
-                self.rrect(S / 2 + 4, y - 26, S / 2 + 4 + bw, y - 10, 8, fill=col)
-                self.text(S / 2 + 4 + bw / 2, y - 18, n, 8, "bold",
-                          BG if col == GOLD else TEXT, anchor="center")
+                bw = max(16, self.measure(n, 8, "bold") + 10)
+                bx = S / 2 + 4
+                step = ys.get("social", 0) - ys.get("compare", 0) if "social" in ys else 58
+                by = y - min(18, step / 2 - 9) - lift      # stays inside its own slot
+                self.rrect(bx - 2, by - 10, bx + bw + 2, by + 10, 10, fill=BAR, depth=0)
+                self.rrect(bx, by - 8, bx + bw, by + 8, 8, fill=col, depth=0.8)
+                self.text(bx + bw / 2, by, n, 8, "bold", BG if col == GOLD else "#ffffff",
+                          anchor="center")
             if hov:
                 tip_draw = (y, tip)
-            y += 58
-        for page, ic, tip, yy in (("settings", "settings", "Settings", h - self.BOTTOM - 40),):
-            key = "side:" + page
-            hov = self.hover == key
-            cur = self.page == page
-            tags = self.hit(key, click=lambda p=page: self.set_page(p), tip=tip)
-            if not cur:
-                f = self.hv(key)
-                if f > 0:
-                    self.rrect(S / 2 - 22, yy - 22, S / 2 + 22, yy + 22, 14,
-                               fill=mix(BAR, CARD, f), tags=tags)
-            self.icon(S / 2, yy, ic, 15, TEXT if cur else self.hcol(key, MUTED, TEXT),
-                      tags=tags)
-            if hov:
-                tip_draw = (yy, tip)
         if self.streamer():
             self.icon(S / 2, h - self.BOTTOM - 92, "eye_off", 13, GOLD)
+        # nav label: slides out from the bar and fades in
+        st = self.tween("sidetip", 1.0 if tip_draw else 0.0, 0.16 if tip_draw else 0.1)
         if tip_draw:
-            ty, tip = tip_draw
-            tw = self.measure(tip, 9, "bold") + 20
-            self.rrect(S + 6, ty - 14, S + 6 + tw, ty + 14, 8, fill=CARD_HI, outline=LINE)
-            self.text(S + 16, ty, tip, 9, "bold")
+            self._side_tip = tip_draw
+        if st > 0.02 and getattr(self, "_side_tip", None):
+            ty, tip = self._side_tip
+            tw = self.measure(tip, 9, "bold") + 22
+            tx = S + 4 + round(6 * st)
+            bgc = mix(BG, mix(SURFACE, CARD_HI, 0.6), st)
+            self.soft(tx, ty - 15, tx + tw, ty + 15, 9, "#000000", alpha=int(140 * st),
+                      spread=10, dy=4)
+            self.rrect(tx, ty - 15, tx + tw, ty + 15, 9, fill=bgc,
+                       outline=mix(bgc, mix(LINE, "#ffffff", 0.08), st), depth=0)
+            self.text(tx + 11, ty, tip, 9, "bold", mix(bgc, TEXT, st))
 
     def draw_bottom(self, w, h):
         B = self.BOTTOM
         top = h - B
-        self.cv.create_rectangle(0, top, w, h, fill=BAR, outline="")
-        self.cv.create_line(0, top, w, top, fill=LINE)
+        bg = self.chrome_photo("bottom", w, B)
+        if bg:
+            self.cv.create_image(0, top, image=bg, anchor="nw")
+        else:
+            self.cv.create_rectangle(0, top, w, h, fill=BAR, outline="")
+            self.cv.create_line(0, top, w, top, fill=LINE)
         mid = top + B / 2
 
         active = self.state_.get("active")
@@ -7373,9 +8189,17 @@ class App(tk.Tk):
             key = "bot:active"
             tags = self.hit(key, click=lambda: self.open_profile(active),
                             tip="Open profile")
+            f = self.hv(key)
+            if f > 0:
+                self.soft(22, mid - 24, 70, mid + 24, 24, ACCENT, alpha=int(90 * f), spread=10,
+                          dy=2, tags=tags)
             self.account_art(22, mid - 24, 48, active, 24, tags=tags)
             m = self.m(active)
-            self.text(84, mid - 10, active, 12, "bold", maxw=220, tags=tags)
+            # signed-in dot on the avatar
+            self.circle(62, mid + 16, 7.5, fill=BAR, depth=0, tags=tags)
+            self.circle(62, mid + 16, 5, fill=GOOD, depth=0, tags=tags)
+            self.text(84, mid - 10, active, 12, "bold", maxw=220, tags=tags,
+                      fill=self.hcol(key, TEXT, "#ffffff"))
             sub = self.rank_text(m) or "Logged in"
             since = self.state_.get("active_since")
             if since:
@@ -7409,21 +8233,33 @@ class App(tk.Tk):
             label = "Working…"
         hov = self.hover == key and not self.busy
         tags = self.hit(key, click=None if self.busy or running else fn, tip=tip)
-        pw = max(170, self.measure(label, 11, "bold") + 76)
+        pw = self.tween("bot:pw", max(170, self.measure(label, 11, "bold") + 76), 0.3, "back")
         f = self.hv(key, hov)
-        col = (mix(SURFACE, GOOD, 0.4) if running else DIM if self.busy else
+        pr = self.pressed(key) if not (self.busy or running) else 0
+        col = (mix(SURFACE, GOOD, 0.4) if running else mix(DIM, ACCENT, 0.25) if self.busy else
                mix(ACCENT, ACCENT_HI, f))
-        if starting:
-            col = mix(ACCENT, ACCENT_HI, 0.5 + 0.5 * math.sin(time.time() * 5))
+        if starting or self.busy:
+            ph = 0.5 + 0.5 * math.sin(time.time() * 4.2)
+            col = mix(ACCENT, ACCENT_HI, ph) if starting else mix(mix(DIM, ACCENT, 0.25), ACCENT,
+                                                                   0.35 * ph)
             self._more = True
-        if f > 0 and not running:
+        if not running:
             self.soft(cx - pw / 2, mid - 24, cx + pw / 2, mid + 24, 24, ACCENT,
-                      alpha=int(130 * f), spread=14, dy=4, tags=tags)
-        self.rrect(cx - pw / 2, mid - 24, cx + pw / 2, mid + 24, 24, fill=col, tags=tags)
+                      alpha=int(55 + 95 * f - 40 * pr), spread=14, dy=int(4 + 2 * f), tags=tags)
+        ins = 2 * pr
+        self.rrect(cx - pw / 2 + ins, mid - 24 + ins, cx + pw / 2 - ins, mid + 24 - ins + 0.5 * pr,
+                   24, fill=col, tags=tags, depth=1.0 - 0.5 * pr)
         lw = self.measure(label, 11, "bold")
-        self.icon(cx - lw / 2 - 10, mid, "check" if running else "play", 12, "#ffffff",
-                  tags=tags)
-        self.text(cx + 10, mid, label, 11, "bold", "#ffffff", anchor="center", tags=tags)
+        dy = 0.5 * pr
+        if self.busy:
+            a = -(time.time() * 320) % 360
+            self.cv.create_arc(cx - lw / 2 - 18, mid - 8 + dy, cx - lw / 2 - 2, mid + 8 + dy,
+                               start=a, extent=250, style="arc", outline="#ffffff", width=2,
+                               tags=tags)
+        else:
+            self.icon(cx - lw / 2 - 10, mid + dy, "check" if running else "play", 12, "#ffffff",
+                      tags=tags)
+        self.text(cx + 10, mid + dy, label, 11, "bold", "#ffffff", anchor="center", tags=tags)
 
         # right: presence status chip + game + message
         mode = self.settings.get("status_mode", "online")
@@ -7436,21 +8272,31 @@ class App(tk.Tk):
         tags = self.hit(key, click=self.status_menu,
                         tip="Offline mode: click to turn on/off or change status")
         x1 = w - 22
-        self.rrect(x1 - tw, mid - 31, x1, mid - 3, 14,
+        pr = self.pressed(key)
+        self.rrect(x1 - tw + pr, mid - 15 + pr, x1 - pr, mid + 15 - pr, 15,
                    fill=mix(CARD, ACCENT, 0.25) if enabled else (self.hcol(key, CARD, CARD_HI, hov)),
-                   outline=ACCENT if enabled else "", tags=tags)
-        self.icon(x1 - tw + 18, mid - 17, "moon", 10, SOFT if enabled else MUTED, tags=tags)
-        self.circle(x1 - tw + 36, mid - 17, 4, fill=dot if enabled else DIM, tags=tags)
-        self.text(x1 - tw + 46, mid - 17, label, 10, "bold", TEXT if enabled else MUTED,
-                  tags=tags)
-        tip = self.hits.get(self.hover, {}).get("tip") if self.hover else None
+                   outline=ACCENT if enabled else mix(LINE, CARD_HI, self.hv(key)), tags=tags,
+                   depth=0.8)
+        self.icon(x1 - tw + 18, mid, "moon", 10, SOFT if enabled else MUTED, tags=tags)
+        if enabled:
+            self.soft(x1 - tw + 32, mid - 4, x1 - tw + 40, mid + 4, 4, dot, alpha=150, spread=5,
+                      dy=0, tags=tags)
+        self.circle(x1 - tw + 36, mid, 4, fill=dot if enabled else DIM, tags=tags)
+        self.text(x1 - tw + 46, mid, label, 10, "bold",
+                  TEXT if enabled else self.hcol(key, MUTED, TEXT), tags=tags)
         status = self.status if time.time() < self.status_until else ""
         if not status and self.running_games:
             names = [g for g, p in GAMES.items() if p in self.running_games]
             status = f"{', '.join(names)} running" if names else ""
-        msg = status
-        if msg:
-            self.text(x1, mid + 14, msg, 9, fill=MUTED, anchor="e", maxw=max(140, w / 2 - 150))
+        # status line sits between the Play button and the offline pill, fading in and out
+        room = (x1 - tw - 18) - (cx + 130)
+        if status:
+            self._bot_status = status
+        a = self.tween("bot:status", 1.0 if status else 0.0, 0.25 if status else 0.4)
+        msg = getattr(self, "_bot_status", "")
+        if msg and a > 0.02 and room > 90:
+            self.text(x1 - tw - 18, mid + round(3 * (1 - a)), msg, 9, fill=mix(BAR, MUTED, a),
+                      anchor="e", maxw=room)
 
     def offline_on(self):
         return bool(self.settings.get("status_enabled")
@@ -7571,9 +8417,7 @@ class App(tk.Tk):
                    fill=mix(CARD, ACCENT, 0.35) if on else (self.hcol(key, CARD, CARD_HI, hov)),
                    outline=ACCENT if on else "", tags=tags)
         self.icon(cx - tw + 18, y + 17, "moon", 10, SOFT if on else MUTED, tags=tags)
-        sx = cx - 34
-        self.rrect(sx, y + 9, sx + 26, y + 25, 8, fill=ACCENT if on else DIM, tags=tags)
-        self.circle(sx + (18 if on else 8), y + 17, 6, fill="#ffffff", tags=tags)
+        self.toggle_switch(cx - 38, y + 17, on, key, tags, w=30, h=18)
         self.text(cx - tw + 32, y + 17, lab, 10, "bold", TEXT if on else self.hcol(key, MUTED, TEXT, hov), tags=tags)
         cx -= tw + 18
         game = self.state_["game"]
@@ -7599,9 +8443,11 @@ class App(tk.Tk):
         else:
             names = archived
         tags = sorted({t for n in full for t in (self.m(n).get("tags") or [])}, key=str.lower)
-        if tags or archived:
+        n_ready = sum(1 for n in full if ranked_status(self.m(n))[0] == "ready")
+        if tags or archived or n_ready:
             y += 34
-            opts = [("", "All")] + [(t, t) for t in tags[:10]]
+            opts = [("", "All")] + ([(self.RANKED_CHIP, f"Ranked ready ({n_ready})")]
+                                    if n_ready else []) + [(t, t) for t in tags[:10]]
             cx = self.chips(x0, y, opts, self.tag_filter, self.set_tag_filter, "tagf", size=8,
                             h=24)
             if archived:
@@ -7615,7 +8461,9 @@ class App(tk.Tk):
                            tags=tg)
                 self.text(cx + 6 + tw / 2, y + 12, lab, 8, "bold", TEXT, anchor="center", tags=tg)
             y -= 4
-        if self.tag_filter:
+        if self.tag_filter == self.RANKED_CHIP:
+            names = [n for n in names if ranked_status(self.m(n))[0] == "ready"]
+        elif self.tag_filter:
             names = [n for n in names if self.tag_filter in (self.m(n).get("tags") or [])]
         q = self.search_var.get().strip().lower()
         if q:
@@ -7635,8 +8483,11 @@ class App(tk.Tk):
             self.draw_add_row(x0, y, x1 - x0)
             y += 76
         else:
-            T, gap, rowh = self.TILE, 22, self.TILE + 112
-            cols = max(1, int((x1 - x0 + gap) // (T + gap)))
+            T, gap = self.TILE, 30
+            rowh = T + self.TILE_INFO + self.TILE_PAD + 20
+            y += self.TILE_PAD
+            x0 += self.TILE_PAD
+            cols = max(1, int((x1 - x0 - self.TILE_PAD + gap) // (T + gap)))
             items = names + ["__add__"]
             for i, name in enumerate(items):
                 tx = x0 + (i % cols) * (T + gap)
@@ -7646,7 +8497,8 @@ class App(tk.Tk):
                 else:
                     self.tile_slots.append((name, tx, ty))
                     self.draw_tile(tx, ty, T, name, full.index(name))
-            y += ((len(items) - 1) // cols + 1) * rowh + 6
+            y += ((len(items) - 1) // cols + 1) * rowh - 4
+            x0 -= self.TILE_PAD
 
         hits = self.store_hits()
         if hits:
@@ -7689,12 +8541,20 @@ class App(tk.Tk):
             key = "act:" + title
             hov = self.hover == key
             tags = self.hit(key, click=fn)
-            if hov:
-                self.glow(rx, ry, rx + rw, ry + 58, 12, tags=tags)
-            self.rrect(rx, ry, rx + rw, ry + 58, 12,
-                       fill=self.hcol(key, mix(SURFACE, CARD, 0.5), CARD_HI, hov), tags=tags)
-            self.rrect(rx + 7, ry + 7, rx + 51, ry + 51, 9,
-                       fill=self.hcol(key, CARD_HI, ACCENT, hov), tags=tags)
+            f = self.hv(key, hov)
+            pr = self.pressed(key)
+            lift = round(2 * f - pr, 1)
+            ry -= lift
+            self.soft(rx, ry, rx + rw, ry + 58, 14, "#000000", alpha=int(60 + 50 * f),
+                      spread=10, dy=int(4 + 3 * f), tags=tags)
+            if f > 0:
+                self.soft(rx, ry, rx + rw, ry + 58, 14, ACCENT, alpha=int(70 * f), spread=10,
+                          dy=2, tags=tags)
+            self.rrect(rx, ry, rx + rw, ry + 58, 14,
+                       fill=self.hcol(key, mix(SURFACE, CARD, 0.4), CARD_HI, hov), tags=tags,
+                       outline=mix(LINE, mix(CARD_HI, SOFT, 0.15), f), depth=1.0)
+            self.rrect(rx + 7, ry + 7, rx + 51, ry + 51, 10,
+                       fill=self.hcol(key, CARD_HI, ACCENT, hov), tags=tags, depth=1.0)
             self.icon(rx + 29, ry + 29, ic, 14, TEXT, tags=tags)
             self.text(rx + 66, ry + 21, title, 11, "bold", maxw=rw - 76, tags=tags)
             self.text(rx + 66, ry + 40, sub, 9, fill=MUTED, maxw=rw - 76, tags=tags)
@@ -7702,6 +8562,17 @@ class App(tk.Tk):
         self.finish_scroll(top, y, h)
         if show_right:
             self.draw_panel(w, h)
+
+    def ranked_pill(self, name):
+        """(label, fill, fg, tip) for the rank-ready pill, or None."""
+        st, lab, tip = ranked_status(self.m(name))
+        if st == "ready":
+            return lab, mix(SURFACE, GOOD, 0.22), GOOD, tip
+        if st == "level":
+            return lab, CARD_HI, MUTED, tip
+        if st == "blocked":
+            return lab, mix(SURFACE, DANGER, 0.25), "#ff9aa8", tip
+        return None
 
     def tile_badges(self, name):
         """(label, fill, fg) badges for an account, most important first."""
@@ -7720,49 +8591,78 @@ class App(tk.Tk):
             out.append(("May need re-login", "#3a2a10", GOLD))
         return out
 
+    TILE_PAD, TILE_INFO = 8, 98   # profile card: padding around the art, info area below
+
+    def tile_card(self, x, y, T, key, f, pr, sel_f=0.0, live=False, color=None, tags=()):
+        """The card a tile sits on. Lifts on hover, sinks on press, glows when selected.
+        Returns the vertical lift so the content can move with it."""
+        P, IB = self.TILE_PAD, self.TILE_INFO
+        lift = round(3 * f - 1.5 * pr, 1)
+        x0, y0, x1, y1 = x - P, y - P - lift, x + T + P, y + T + IB - lift
+        self.soft(x0, y0, x1, y1, 18, "#000000", alpha=int(80 + 50 * f), spread=14,
+                  dy=int(6 + 5 * f), tags=tags)
+        if sel_f > 0:
+            self.soft(x0, y0, x1, y1, 18, ACCENT, alpha=int(105 * sel_f), spread=12, dy=2,
+                      tags=tags)
+        elif f > 0 and color:
+            self.soft(x0, y0, x1, y1, 18, color, alpha=int(60 * f), spread=12, dy=4, tags=tags)
+        fill = mix(mix(SURFACE, CARD, 0.32), CARD_HI, 0.22 * f)
+        if pr:
+            fill = mix(fill, SURFACE, 0.35 * pr)
+        out = mix(mix(LINE, CARD_HI, 0.5 * f), ACCENT, sel_f) if sel_f else \
+            mix(LINE, mix(CARD_HI, SOFT, 0.15), f)
+        self.rrect(x0, y0, x1, y1, 18, fill=fill, outline=out, width=2 if sel_f > 0.5 else 1,
+                   depth=1.0, tags=tags)
+        if self.kbd_focus and sel_f >= 1:    # keyboard focus: a clear ring outside the card
+            self.rrect(x0 - 4, y0 - 4, x1 + 4, y1 + 4, 21, fill="", depth=0,
+                       outline=mix(ACCENT_HI, "#ffffff", 0.35), width=1.5)
+        if live:   # logged-in account: a soft green light along the top edge
+            cx, ww = (x0 + x1) / 2, (x1 - x0) * 0.42
+            self.soft(cx - ww / 2, y0 - 1, cx + ww / 2, y0 + 2, 2, GOOD, alpha=150, spread=6,
+                      dy=0, tags=tags)
+            self.rrect(cx - ww / 2, y0, cx + ww / 2, y0 + 2.5, 1.2, fill=GOOD, depth=0,
+                       tags=tags)
+        return lift
+
     def draw_tile(self, x, y, T, name, idx):
         key, pkey = "tile:" + name, "play:" + name
         m = self.m(name)
-        if self.dragging == name:
-            self.rrect(x, y, x + T, y + T, 14, fill=mix(BG, CARD, 0.4), outline=DIM,
-                       dash=(5, 4))
+        P, IB = self.TILE_PAD, self.TILE_INFO
+        if self.dragging == name:   # the empty slot it left behind
+            self.rrect(x - P, y - P, x + T + P, y + T + IB, 18, fill=mix(BG, SURFACE, 0.5),
+                       outline=mix(LINE, ACCENT, 0.5), depth=0)
             return
         hov = self.hover in (key, pkey) and not self.dragging
         sel = self.selected == name
+        live = self.state_.get("active") == name and not m.get("expired")
         tags = self.hit(key, click=lambda: self.select(name), dbl=lambda: self.switch(name),
                         right=lambda e: self.popup(e, name))
         lc = m.get("color")
         f = self.hv(key, hov)
-        ty0 = y
-        y = y - round(4 * f)          # the art lifts a little on hover
-        if f > 0 and not sel:
-            self.soft(x, y, x + T, y + T, 14, lc or ACCENT, alpha=int(110 * f), spread=12,
-                      dy=6, tags=tags)
-        sf = self.tween("sel:" + name, 1.0 if sel else 0.0, 0.25)
-        sf = round(sf * 8) / 8
-        if sf > 0:
-            self.soft(x, y, x + T, y + T, 14, ACCENT, alpha=int(120 * sf), spread=10, dy=0,
-                      tags=tags)
-            g = 4 * sf
-            self.rrect(x - g, y - g, x + T + g, y + T + g, 14 + g, fill="",
-                       outline=mix(BG, ACCENT, sf), width=2, tags=tags)
-        self.account_art(x, y, T, name, 14, tags, hov)
+        pr = self.pressed(key)
+        sf = round(self.tween("sel:" + name, 1.0 if sel else 0.0, 0.3) * 8) / 8
+        lift = self.tile_card(x, y, T, key, f, pr, sf, live, lc, tags)
+        y = y - lift
+        self.account_art(x, y, T, name, 12, tags, hov)
         if lc:
-            self.circle(x + T - 12, y + 12, 6, fill=lc, outline=BG, width=2, tags=tags)
+            self.circle(x + T - 13, y + 13, 6.5, fill=lc, outline=mix(BG, lc, 0.25), width=2,
+                        tags=tags)
         badges = self.tile_badges(name)
         if badges:
             lab, fill, fg = badges[0]
             bw = min(T - 16, self.measure(lab, 8, "bold") + 18)
-            self.rrect(x + 8, y + 8, x + 8 + bw, y + 30, 11, fill=fill, tags=tags)
+            self.soft(x + 8, y + 8, x + 8 + bw, y + 30, 11, "#000000", alpha=90, spread=6, dy=2,
+                      tags=tags)
+            self.rrect(x + 8, y + 8, x + 8 + bw, y + 30, 11, fill=fill, tags=tags, depth=0.6)
             self.text(x + 8 + bw / 2, y + 19, lab, 8, "bold", fg, anchor="center",
                       maxw=bw - 10, tags=tags)
-        if self.settings.get("hotkeys") and idx < 9 and hov:
+        if self.settings.get("hotkeys") and idx < 9 and f > 0:
             lab = f"Ctrl+Alt+{idx + 1}"
             bw = self.measure(lab, 8, "bold") + 14
-            self.rrect(x + T - 8 - bw, y + T - 64, x + T - 8, y + T - 42, 11, fill="#0c0917",
-                       tags=tags)
-            self.text(x + T - 8 - bw / 2, y + T - 53, lab, 8, "bold", MUTED, anchor="center",
-                      tags=tags)
+            self.rrect(x + T - 8 - bw, y + T - 64, x + T - 8, y + T - 42, 11,
+                       fill=mix(BG, "#0c0917", f), tags=tags)
+            self.text(x + T - 8 - bw / 2, y + T - 53, lab, 8, "bold", mix(BG, MUTED, f),
+                      anchor="center", tags=tags)
         tier = m.get("tier")
         if tier and tier >= 3 and self.images:
             self.circle(x + 26, y + T - 26, 21, fill="#0c0917", tags=tags)
@@ -7771,21 +8671,31 @@ class App(tk.Tk):
             ptags = self.hit(pkey, click=lambda: self.switch(name),
                              right=lambda e: self.popup(e, name))
             pf = self.hv(pkey)
-            r = 12 + 8 * f + 2 * pf
-            self.circle(x + T - 30, y + T - 30, r, fill=mix(ACCENT, ACCENT_HI, pf), tags=ptags)
+            ppr = self.pressed(pkey)
+            r = 12 + 8 * f + 2 * pf - 1.5 * ppr
+            self.soft(x + T - 30 - r, y + T - 30 - r, x + T - 30 + r, y + T - 30 + r, r, ACCENT,
+                      alpha=int(120 * f), spread=8, dy=3, tags=ptags)
+            self.circle(x + T - 30, y + T - 30, r, fill=mix(ACCENT, ACCENT_HI, pf), tags=ptags,
+                        depth=1.0)
             if f > 0.5:
                 self.icon(x + T - 29, y + T - 30, "play", 12, "#ffffff", tags=ptags)
-        y = ty0
 
-        self.text(x + 2, y + T + 17, name, 11, "bold", maxw=T, tags=tags)
-        self.text(x + 2, y + T + 36, self.rid(m) or ago(self.state_["last_used"].get(name)), 9,
+        ix = x + 2
+        self.text(ix, y + T + 20, name, 11, "bold", maxw=T, tags=tags)
+        self.text(ix, y + T + 39, self.rid(m) or ago(self.state_["last_used"].get(name)), 9,
                   fill=MUTED, maxw=T, tags=tags)
         rt = self.rank_text(m)
         if rt:
             col = ASSETS.tier_color(tier) or DIM
-            self.text(x + 2, y + T + 54, rt, 9, "bold", mix(col, "#ffffff", 0.35), maxw=T,
+            self.text(ix, y + T + 57, rt, 9, "bold", mix(col, "#ffffff", 0.35), maxw=T,
                       tags=tags)
-        tx, ty = x + 1, y + T + 76
+        tx, ty = x, y + T + 80
+        rp = self.ranked_pill(name)
+        if rp and not m.get("expired"):
+            wpill = self.measure(rp[0], 8, "bold") + 16
+            self.pill(tx, ty, rp[0], fill=rp[1], fg=rp[2],
+                      tags=self.hit("rk:" + name, click=lambda: self.select(name), tip=rp[3]))
+            tx += wpill + 4
         for t in (m.get("tags") or [])[:3]:
             wpill = self.measure(t, 8, "bold") + 16
             if tx + wpill > x + T + 4:
@@ -7804,8 +8714,28 @@ class App(tk.Tk):
         sel = self.selected == name
         tags = self.hit(key, click=lambda: self.select(name), dbl=lambda: self.switch(name),
                         right=lambda e: self.popup(e, name))
-        self.rrect(x, y, x + w, y + 60, 14, fill=CARD_HI if hov else SURFACE,
-                   outline=ACCENT if sel else LINE, width=2 if sel else 1, tags=tags)
+        f = self.hv(key, hov)
+        pr = self.pressed(key)
+        sf = round(self.tween("sel:" + name, 1.0 if sel else 0.0, 0.3) * 8) / 8
+        live = self.state_.get("active") == name and not m.get("expired")
+        if sf > 0:
+            self.soft(x, y, x + w, y + 60, 14, ACCENT, alpha=int(80 * sf), spread=10, dy=1,
+                      tags=tags)
+        elif f > 0:
+            self.soft(x, y, x + w, y + 60, 14, "#000000", alpha=int(90 * f), spread=10, dy=4,
+                      tags=tags)
+        fill = mix(mix(SURFACE, CARD, 0.25), CARD_HI, 0.6 * f)
+        if pr:
+            fill = mix(fill, SURFACE, 0.4 * pr)
+        self.rrect(x + pr, y + pr, x + w - pr, y + 60 - pr, 14, fill=fill,
+                   outline=mix(mix(LINE, CARD_HI, f), ACCENT, sf), width=2 if sf > 0.5 else 1,
+                   tags=tags, depth=1.0)
+        if self.kbd_focus and sel:
+            self.rrect(x - 4, y - 4, x + w + 4, y + 64, 17, fill="", depth=0,
+                       outline=mix(ACCENT_HI, "#ffffff", 0.35), width=1.5)
+        if live:
+            self.soft(x + 1, y + 16, x + 4, y + 44, 2, GOOD, alpha=150, spread=5, dy=0, tags=tags)
+            self.rrect(x + 1, y + 16, x + 4, y + 44, 1.5, fill=GOOD, depth=0, tags=tags)
         self.account_art(x + 9, y + 9, 42, name, 10, tags)
         if m.get("color"):
             self.rrect(x, y + 12, x + 4, y + 48, 2, fill=m["color"], tags=tags)
@@ -7834,6 +8764,13 @@ class App(tk.Tk):
             if tx + pw > limit:
                 continue
             tx += self.pill(tx, y + 30, lab, fill=fill, fg=fg, tags=tags) + 6
+        rp = self.ranked_pill(name)
+        if rp and not m.get("expired"):
+            pw = self.measure(rp[0], 8, "bold") + 16
+            if tx + pw <= limit:
+                tx += self.pill(tx, y + 30, rp[0], fill=rp[1], fg=rp[2],
+                                tags=self.hit("rk:" + name, click=lambda: self.select(name),
+                                              tip=rp[3])) + 6
         for t in (m.get("tags") or [])[:3]:
             pw = self.measure(t, 8, "bold") + 16
             if tx + pw > limit:
@@ -7844,9 +8781,13 @@ class App(tk.Tk):
                       tags=tags)
         ptags = self.hit(pkey, click=lambda: self.switch(name),
                          right=lambda e: self.popup(e, name))
-        ph = self.hover == pkey
-        self.circle(x + w - 32, y + 30, 18, fill=ACCENT_HI if ph else (ACCENT if hov else CARD),
-                    tags=ptags)
+        pf = self.hv(pkey)
+        ppr = self.pressed(pkey)
+        if pf > 0:
+            self.soft(x + w - 50, y + 12, x + w - 14, y + 48, 18, ACCENT, alpha=int(120 * pf),
+                      spread=8, dy=2, tags=ptags)
+        self.circle(x + w - 32, y + 30, 18 + 1.5 * pf - 1.5 * ppr,
+                    fill=mix(mix(CARD, ACCENT, f), ACCENT_HI, pf), tags=ptags, depth=1.0)
         self.icon(x + w - 31, y + 30, "play", 10, "#ffffff", tags=ptags)
 
     def draw_add_row(self, x, y, w):
@@ -7864,15 +8805,25 @@ class App(tk.Tk):
         hov = self.hover == key
         tags = self.hit(key, click=self.add_new)
         f = self.hv(key, hov)
-        self.rrect(x, y, x + T, y + T, 14, fill=mix(SURFACE, CARD, 0.4 + 0.5 * f),
-                   outline=mix(LINE, ACCENT, 0.2 + 0.6 * f), width=1, tags=tags)
+        pr = self.pressed(key)
+        P, IB = self.TILE_PAD, self.TILE_INFO
+        lift = round(2 * f - 1.5 * pr, 1)
+        x0, y0, x1, y1 = x - P, y - P - lift, x + T + P, y + T + IB - lift
         if f > 0:
-            self.soft(x + T / 2 - 26, y + T / 2 - 26, x + T / 2 + 26, y + T / 2 + 26, 26,
-                      ACCENT, alpha=int(120 * f), spread=12, dy=0, tags=tags)
-        self.circle(x + T / 2, y + T / 2, 24 + 2 * f, fill=mix(CARD_HI, ACCENT, f), tags=tags)
-        self.icon(x + T / 2, y + T / 2, "add", 14, TEXT, tags=tags)
-        self.text(x + 2, y + T + 17, "Add account", 11, "bold", tags=tags)
-        self.text(x + 2, y + T + 36, "Sign in a new one", 9, fill=MUTED, tags=tags)
+            self.soft(x0, y0, x1, y1, 18, ACCENT, alpha=int(70 * f), spread=12, dy=4, tags=tags)
+        self.rrect(x0, y0, x1, y1, 18, fill=mix(mix(BG, SURFACE, 0.55), SURFACE, f),
+                   outline=mix(mix(LINE, BG, 0.2), ACCENT, 0.15 + 0.55 * f), depth=0.6, tags=tags)
+        cx, cy = x + T / 2, y + T / 2 - lift
+        self.rrect(x, y - lift, x + T, y + T - lift, 12, fill=mix(BG, CARD, 0.45 + 0.25 * f),
+                   depth=0, tags=tags)
+        if f > 0:
+            self.soft(cx - 26, cy - 26, cx + 26, cy + 26, 26, ACCENT, alpha=int(120 * f),
+                      spread=12, dy=0, tags=tags)
+        r = 24 + 3 * f - 2 * pr
+        self.circle(cx, cy, r, fill=mix(CARD_HI, ACCENT, f), tags=tags, depth=1.0)
+        self.icon(cx, cy, "add", 14, TEXT, tags=tags)
+        self.text(x + 2, y + T + 20 - lift, "Add account", 11, "bold", tags=tags)
+        self.text(x + 2, y + T + 39 - lift, "Sign in a new one", 9, fill=MUTED, tags=tags)
 
     def draw_drag_ghost(self):
         x, y = self.drag_pos
@@ -7880,10 +8831,17 @@ class App(tk.Tk):
         if 0 <= idx < len(self.tile_slots):
             _, sx, sy = self.tile_slots[idx]
             if self.settings.get("layout") == "list":
-                self.rrect(sx, sy - 6, sx + 300, sy - 3, 1, fill=ACCENT)
+                gy = self.tween("drop:y", sy - 5, 0.16)
+                self.rrect(sx, gy - 1.5, sx + 300, gy + 1.5, 1.5, fill=ACCENT, depth=0)
             else:
-                self.rrect(sx - 12, sy, sx - 8, sy + self.TILE, 2, fill=ACCENT)
+                gx = self.tween("drop:x", sx - 19, 0.16)
+                gy = self.tween("drop:gy", sy, 0.16)
+                self.soft(gx - 2, gy, gx + 2, gy + self.TILE, 2, ACCENT, alpha=160, spread=6,
+                          dy=0)
+                self.rrect(gx - 2, gy, gx + 2, gy + self.TILE, 2, fill=ACCENT, depth=0)
         s = 84
+        self.soft(x - s / 2, y - s / 2, x + s / 2, y + s / 2, 14, "#000000", alpha=150,
+                  spread=16, dy=12)
         self.account_art(x - s / 2, y - s / 2, s, self.dragging, 12)
         self.rrect(x - s / 2 - 3, y - s / 2 - 3, x + s / 2 + 3, y + s / 2 + 3, 14, fill="",
                    outline=ACCENT, width=2)
@@ -8107,7 +9065,11 @@ class App(tk.Tk):
         dflt = self.m(name).get("default_game") or self.state_["game"]
         hero = dflt if dflt in games else games[0]
         others = [g for g in games if g != hero]
-        hh = max(300, min(430, (h - self.BOTTOM - y - 40) * (0.62 if others else 1)))
+        room = h - self.BOTTOM - y - 30
+        if others:      # fit the hero and the row of smaller cards in the window when we can
+            hh = max(220, min(430, room - 190 - 18))
+        else:
+            hh = max(260, min(430, room))
         self.game_card(x0, y, x1, y + hh, hero, big=True)
         y += hh + 18
         if others:
@@ -8208,9 +9170,12 @@ class App(tk.Tk):
         f = self.hv(key, self.hover in (key, bkey))
         tags = self.hit(key, click=lambda: self.play_game(game),
                         tip=f"Play {game}")
-        lift = round(3 * f)
+        pr = self.pressed(key)
+        lift = round(3 * f - 1.5 * pr, 1)
         y0 -= lift
         y1 -= lift
+        self.soft(x0, y0, x1, y1, 22, "#000000", alpha=int(80 + 40 * f), spread=16,
+                  dy=int(6 + 4 * f), tags=tags)
         if f > 0:
             self.soft(x0, y0, x1, y1, 22, col, alpha=int(90 * f), spread=16, dy=8, tags=tags)
         r = 22 if big else 18
@@ -8222,8 +9187,9 @@ class App(tk.Tk):
         running = prod in self.running_games
         starting = prod in self.launching and not running
         pad = 34 if big else 22
-        # title block
-        ty = y1 - (128 if big else 92)
+        # title block (narrow cards stack the title above the button instead of beside it)
+        narrow = not big and (x1 - x0) < self.measure(game, 17, "bold") + 120 + pad * 3
+        ty = y1 - (128 if big else (112 if narrow else 92))
         self.text(x0 + pad, ty, look.get("tag", ""), 9 if big else 8, "bold",
                   mix(col, "#ffffff", 0.45), tags=tags)
         self.text(x0 + pad, ty + (34 if big else 26), game, 30 if big else 17, "bold",
@@ -8237,8 +9203,11 @@ class App(tk.Tk):
         label = "Running" if running else ("Starting…" if starting else "Play")
         bwid = (190 if big else 120)
         bx1, by1 = x1 - pad, y1 - pad
+        if narrow:
+            by1 = y1 - 16
         bx0, by0 = bx1 - bwid, by1 - bh
         pf = self.hv(bkey)
+        bpr = self.pressed(bkey)
         btags = self.hit(bkey, click=lambda: self.play_game(game),
                          tip=("Already running" if running else f"Play {game} on "
                               f"{self.play_account()}"))
@@ -8250,10 +9219,14 @@ class App(tk.Tk):
             self._more = True
         else:
             fill = mix(col, mix(col, "#ffffff", 0.25), pf)
-        if pf > 0 and not running:
-            self.soft(bx0, by0, bx1, by1, bh / 2, col, alpha=int(140 * pf), spread=12, dy=4,
-                      tags=btags)
-        self.rrect(bx0, by0, bx1, by1, bh / 2, fill=fill, tags=btags)
+        if not running:
+            self.soft(bx0, by0, bx1, by1, bh / 2, col, alpha=int(40 + 110 * pf - 30 * bpr),
+                      spread=12, dy=4, tags=btags)
+        if bpr:
+            fill = mix(fill, mix(col, "#000000", 0.3), 0.5 * bpr)
+        ins = 1.5 * bpr
+        self.rrect(bx0 + ins, by0 + ins, bx1 - ins, by1 - ins, bh / 2, fill=fill, tags=btags,
+                   depth=1.0 - 0.5 * bpr)
         icon = "check" if running else "play"
         lw = self.measure(label, 14 if big else 11, "bold")
         cx = (bx0 + bx1) / 2
@@ -8324,9 +9297,14 @@ class App(tk.Tk):
     def draw_panel(self, w, h):
         px0, px1 = w - self.RIGHT - 18, w - 18
         py0, py1 = 18, h - self.BOTTOM - 10
+        self.soft(px0, py0, px1, py1, 20, "#000000", alpha=90, spread=14, dy=6)
         self.rrect(px0, py0, px1, py1, 20, fill=SURFACE, outline=LINE)
         midx = (px0 + px1) / 2
         name = self.selected if self.selected in self.accounts() else None
+        if name != getattr(self, "_panel_name", name):
+            self._panel_t = time.time()
+        self._panel_name = name
+        self._panel_mark = (self.cv.find_all() or (0,))[-1]
         if not name:
             cy = (py0 + py1) / 2
             self.circle(midx, cy - 40, 30, fill="", outline=DIM, width=2)
@@ -8345,9 +9323,11 @@ class App(tk.Tk):
             key = "tool:" + ic
             hov = self.hover == key
             tags = self.hit(key, click=fn, tip=tip)
-            self.circle(bx, py0 + 26, 16, fill=(DANGER if ic == "delete" else CARD_HI)
-                        if hov else CARD, tags=tags)
-            self.icon(bx, py0 + 26, ic, 10, TEXT, tags=tags)
+            hot = mix(CARD, DANGER, 0.75) if ic == "delete" else CARD_HI
+            pr = self.pressed(key)
+            self.circle(bx, py0 + 26, 16 - pr, fill=self.hcol(key, CARD, hot, hov), tags=tags,
+                        depth=0.8)
+            self.icon(bx, py0 + 26, ic, 10, self.hcol(key, SOFT, TEXT, hov), tags=tags)
             bx -= 38
 
         bottom_reserved = 150
@@ -8408,21 +9388,31 @@ class App(tk.Tk):
                                 width=self.RIGHT - 60, justify="center", anchor="n")
             y += 18 * min(3, 1 + self.measure(m["note"], 9) // (self.RIGHT - 60)) + 6
         self.panel_extras(name, m, px0 + 18, px1 - 18, y + 10, py1 - 142)
+        self.panel_fade(px0, py0, px1, py1 - 140)
 
         key = "panel:profile"
         hov = self.hover == key
         tags = self.hit(key, click=lambda: self.open_profile(name))
         by = py1 - 130
-        self.rrect(px0 + 22, by, px1 - 22, by + 40, 20, fill=self.hcol(key, CARD, CARD_HI, hov),
-                   tags=tags)
-        self.text(midx, by + 20, "Profile, store & inventory", 10, "bold",
+        pr = self.pressed(key)
+        self.rrect(px0 + 22 + pr, by + pr, px1 - 22 - pr, by + 40 - pr, 20,
+                   fill=self.hcol(key, CARD, CARD_HI, hov), tags=tags,
+                   outline=mix(LINE, CARD_HI, self.hv(key)), depth=0.8)
+        self.text(midx, by + 20 + 0.5 * pr, "Profile, store & inventory", 10, "bold",
                   self.hcol(key, SOFT, TEXT, hov), anchor="center", tags=tags)
         key = "panel:login"
         hov = self.hover == key and not self.busy
         tags = self.hit(key, click=lambda: self.switch(name))
         by = py1 - 80
-        self.rrect(px0 + 22, by, px1 - 22, by + 46, 23,
-                   fill=DIM if self.busy else (self.hcol(key, ACCENT, ACCENT_HI, hov)), tags=tags)
+        f = self.hv(key, hov)
+        pr = self.pressed(key) if not self.busy else 0
+        if not self.busy:
+            self.soft(px0 + 22, by, px1 - 22, by + 46, 23, ACCENT, alpha=int(50 + 90 * f - 30 * pr),
+                      spread=12, dy=int(3 + 2 * f), tags=tags)
+        self.rrect(px0 + 22 + 1.5 * pr, by + 1.5 * pr, px1 - 22 - 1.5 * pr, by + 46 - 1.5 * pr, 23,
+                   fill=mix(DIM, ACCENT, 0.3) if self.busy else (self.hcol(key, ACCENT, ACCENT_HI,
+                                                                         hov)),
+                   tags=tags, depth=1.0 - 0.5 * pr)
         active = self.state_.get("active") == name
         game = self.m(name).get("default_game") or self.state_["game"]
         playable = bool(GAMES.get(game))
@@ -8441,6 +9431,26 @@ class App(tk.Tk):
                                                         by + 72, "sw"),
                         tip="Pick a different game for this login")
         self.text(midx, by + 62, sub, 9, fill=self.hcol(key, DIM, SOFT, hov), anchor="center", tags=tags)
+
+    def panel_fade(self, x0, y0, x1, y1):
+        """When a different account is selected, its details glide up and fade in."""
+        if not self.settings.get("animations", True):
+            return
+        age = time.time() - getattr(self, "_panel_t", 0)
+        dur = 0.32
+        if age >= dur:
+            return
+        self._more = True
+        k = ease_out_quint(age / dur)
+        dy = round((1 - k) * 10, 1)
+        mk = self._panel_mark
+        if dy >= 0.5:
+            for item in self.cv.find_all():
+                if item > mk:
+                    self.cv.move(item, 0, dy)
+        a = round((1 - ease_out(age / (dur * 0.8))) * 6) / 6
+        if a > 0:
+            self.rrect(x0 + 1, y0 + 1, x1 - 1, y1, 19, fill=SURFACE, depth=0, alpha=a)
 
     # ------------------------------------------------------------ profile
     def draw_profile(self, w, h):
@@ -8523,23 +9533,24 @@ class App(tk.Tk):
         if self.ptab in ("inventory", "collections"):
             self.place_search(x1, y + 16, hint="Search  (Ctrl+F)")
         y += 50
+        self.mark_tab_content(y)
 
         if self.ptab == "league":
             y = self.draw_league(name, m, x0, x1, y, h, active)
             self.finish_scroll(top, y, h)
             return
         if not m.get("puuid"):
-            self.rrect(x0, y, x1, y + 120, 16, fill=SURFACE, outline=LINE)
-            self.text((x0 + x1) / 2, y + 46, "No VALORANT data yet", 13, "bold",
-                      anchor="center")
             msg = ("Hit Refresh stats to load rank, store and inventory." if active else
                    "Log into this account with RiotHub and everything loads "
                    "automatically.")
+            tone = None
             if ASSETS.error and not ASSETS.ready:
                 msg = "Couldn't reach valorant-api.com for game data: " + ASSETS.error
-            self.text((x0 + x1) / 2, y + 74, msg, 10, fill=MUTED, anchor="center",
-                      maxw=bw - 40)
-            self.finish_scroll(top, y + 130, h)
+                tone = DANGER
+            act = (("Refresh stats", lambda: self.refresh_stats(name), "prof:empty", "refresh")
+                   if active else ("Log in", lambda: self.switch(name), "prof:empty", "play"))
+            y = self.empty_state(x0, x1, y, "person", "No VALORANT data yet", msg, act, tone)
+            self.finish_scroll(top, y + 10, h)
             return
 
         fn = {"overview": self.draw_overview, "matches": self.draw_matches,
@@ -8578,7 +9589,8 @@ class App(tk.Tk):
             ry = y + 52 + i * 21
             if not self.image(ASSETS.currency_icons.get(cid), cx + 18, ry - 8, 16, 16):
                 self.circle(cx + 26, ry, 5, fill=SOFT)
-            self.text(cx + 44, ry, self.money(wallet.get(cid, 0)), 10, "bold")
+            self.text(cx + 44, ry, self.money(self.count(f"wal:{name}:{cid}",
+                                                         wallet.get(cid, 0))), 10, "bold")
             self.text(cx + cw - 18, ry, label, 9, fill=MUTED, anchor="e")
         y += ch + g
 
@@ -8586,15 +9598,16 @@ class App(tk.Tk):
         gw = (bw - g) * 0.64
         gh = 230
         self.card_box(x0, y, x0 + gw, y + gh, "RR history · last ranked games", "history")
-        self.draw_rr_graph(m.get("rr_history") or [], x0 + 18, y + 44, gw - 36, gh - 64)
+        self.draw_rr_graph(m.get("rr_history") or [], x0 + 18, y + 56, gw - 36, gh - 76)
         bx = x0 + gw + g
         self.card_box(bx, y, x1, y + gh, "Battle pass", "trophy")
         con = m.get("contracts") or {}
         bp = con.get("bp")
         if bp:
             self.text(bx + 18, y + 56, bp["name"], 11, "bold", maxw=x1 - bx - 36)
-            self.text(bx + 18, y + 84, f"Tier {bp['level']}", 20, "bold", SOFT)
-            self.text(bx + 24 + self.measure(f"Tier {bp['level']}", 20, "bold"), y + 88,
+            tier_lab = f"Tier {self.count('bp:' + name, bp['level'], 0.7)}"
+            self.text(bx + 18, y + 84, tier_lab, 20, "bold", SOFT)
+            self.text(bx + 24 + self.measure(tier_lab, 20, "bold"), y + 88,
                       f"/ {bp['total']}", 11, fill=MUTED)
             self.bar(bx + 18, y + 108, x1 - bx - 36, bp["level"] / max(1, bp["total"]), 10)
             if bp.get("need"):
@@ -8625,7 +9638,8 @@ class App(tk.Tk):
         self.card_box(x0, y, x0 + cw, y + ch, "Inventory value", "shop")
         val, priced = inventory_value(m) if ASSETS.ready else (0, 0)
         nskins = len(owned_skin_set(m)) if ASSETS.ready else 0
-        self.text(x0 + 18, y + 62, f"≈ {self.money(val)} VP" if val else "—", 18, "bold", GOLD)
+        self.text(x0 + 18, y + 62, f"≈ {self.money(self.count('val:' + name, val, 1.1))} VP"
+                  if val else "—", 18, "bold", GOLD)
         free = nskins - priced
         self.text(x0 + 18, y + 88, f"{nskins} skins" + (f" · {free} free / battle pass"
                                                        if free else "")
@@ -8673,7 +9687,8 @@ class App(tk.Tk):
         if t["games"]:
             self.text(x0 + 18, y + 62, f"{t['w']}W  {t['l']}L", 18, "bold")
             rc = GOOD if t["rr"] > 0 else (DANGER if t["rr"] < 0 else MUTED)
-            self.text(x0 + cw - 18, y + 62, f"{t['rr']:+d} RR", 14, "bold", rc, anchor="e")
+            self.text(x0 + cw - 18, y + 62, f"{self.count('today:' + name, t['rr']):+d} RR", 14,
+                      "bold", rc, anchor="e")
         else:
             self.text(x0 + 18, y + 62, "No ranked games yet", 13, "bold", MUTED)
         if t["streak"] >= 2:
@@ -8711,7 +9726,7 @@ class App(tk.Tk):
         self.card_box(lx, y, lx + cw, y + ch, "Account level", "bolt")
         lvl = m.get("level") or 0
         xp = m.get("xp") or 0
-        self.text(lx + 18, y + 60, f"Level {lvl}", 18, "bold")
+        self.text(lx + 18, y + 60, f"Level {self.count('lvl:' + name, lvl, 0.8)}", 18, "bold")
         self.bar(lx + 18, y + 84, cw - 36, xp / 5000, 6)
         self.text(lx + cw - 18, y + 60, f"{xp:,} / 5,000 XP", 9, fill=MUTED, anchor="e")
         y += ch + g
@@ -8811,14 +9826,17 @@ class App(tk.Tk):
         coords = []
         for i, v in enumerate(vals):
             coords += [gx0 + gw * i / (n - 1), py(v)]
+        reveal = self.tween_from("cnt:graph", 0.0, 1.0, 0.9, "quint", delay=0.08)
         if HAS_PIL:
-            self.graph_image(coords, int(gx0), int(y), int(gw), int(h))
+            self.graph_image(coords, int(gx0), int(y), int(gw), int(h), reveal)
         else:
             poly = coords + [gx0 + gw, y + h, gx0, y + h]
             self.cv.create_polygon(poly, fill=mix(SURFACE, ACCENT, 0.16), outline="")
             self.cv.create_line(coords, fill=ACCENT, width=3, smooth=True, capstyle="round")
         for i, p in enumerate(pts):
             cx, cy = coords[2 * i], coords[2 * i + 1]
+            if (cx - gx0) / max(1, gw) > reveal + 0.001:
+                continue
             col = GOOD if p["delta"] > 0 else (DANGER if p["delta"] < 0 else MUTED)
             key = f"rr:{i}"
             tags = self.hit(key, tip=f"{ASSETS.tier_name(p['tier'])} {p['rr']} RR  "
@@ -8828,10 +9846,23 @@ class App(tk.Tk):
         last = pts[-1]
         self.text(gx0 + gw, y - 14, f"{last['rr']} RR", 10, "bold", SOFT, anchor="e")
 
-    def graph_image(self, coords, gx, gy, gw, gh):
-        """Anti-aliased line + gradient fill for the RR graph."""
-        key = ("graph", tuple(round(c) for c in coords), gx, gy, gw, gh, ACCENT, SURFACE)
+    def graph_image(self, coords, gx, gy, gw, gh, reveal=1.0):
+        """Anti-aliased line + gradient fill for the RR graph (revealed left to right)."""
+        step = max(1, min(12, round(reveal * 12)))
+        base_key = ("graph", tuple(round(c) for c in coords), gx, gy, gw, gh, ACCENT, SURFACE)
+        key = base_key + (step,)
         im = self._shapes.get(key)
+        if im is None and step < 12:
+            full = self.__dict__.setdefault("_graph_pil", {}).get(base_key)
+            if full is None:
+                self.graph_image(coords, gx, gy, gw, gh, 1.0)
+                full = self._graph_pil.get(base_key)
+            if full is not None:
+                cw = max(1, int(full.width * step / 12))
+                part = Image.new("RGBA", full.size, (0, 0, 0, 0))
+                part.paste(full.crop((0, 0, cw, full.height)), (0, 0))
+                im = ImageTk.PhotoImage(part)
+                self._shapes[key] = im
         if im is None:
             s_ = 3
             pad = 6
@@ -8853,16 +9884,21 @@ class App(tk.Tk):
             for px_, py_ in (pts[0], pts[-1]):
                 d.ellipse((px_ - 1.5 * s_, py_ - 1.5 * s_, px_ + 1.5 * s_, py_ + 1.5 * s_),
                           fill=acc + (255,))
-            im = ImageTk.PhotoImage(layer.resize((W // s_, H // s_), Image.LANCZOS))
+            small = layer.resize((W // s_, H // s_), Image.LANCZOS)
+            gp = self.__dict__.setdefault("_graph_pil", {})
+            if len(gp) > 8:
+                gp.clear()
+            gp[base_key] = small
+            im = ImageTk.PhotoImage(small)
             self._shapes[key] = im
         self.cv.create_image(gx - 6, gy - 6, image=im, anchor="nw")
 
     def draw_matches(self, name, m, x0, x1, y, h, active):
         matches = m.get("matches") or []
         if not matches:
-            self.text((x0 + x1) / 2, y + 40, "No recent matches yet.", 11, fill=MUTED,
-                      anchor="center")
-            return y + 80
+            return self.empty_state(x0, x1, y, "history", "No recent matches yet",
+                                    "Play a game and refresh stats - your last matches, "
+                                    "scoreboards and round-by-round results show up here.")
         wins = sum(1 for mt in matches if mt.get("won") is True)
         losses = sum(1 for mt in matches if mt.get("won") is False)
         kd_k = sum(mt["k"] for mt in matches)
@@ -8996,6 +10032,7 @@ class App(tk.Tk):
         self.chips(x0, y, [(t, f"{lab}  {len(items_all[t])}") for t, lab in tabs],
                    self.inv_tab, self.set_inv_tab, "inv", size=9, h=28)
         y += 42
+        self.mark_tab_content(y)
         items = items_all[self.inv_tab]
         if self.inv_tab == "skins" and items:
             weapons = ["All"] + list(dict.fromkeys(s["weapon"] for s in items))
@@ -9039,11 +10076,14 @@ class App(tk.Tk):
         if q:
             items = [s for s in items if q in s["name"].lower() or q in s["sub"].lower()]
         if not items:
-            msg = "Nothing here yet." if not q else "No matches."
             if not ASSETS.ready:
-                msg = "Loading game data…"
-            self.text((x0 + x1) / 2, y + 40, msg, 11, fill=MUTED, anchor="center")
-            return y + 80
+                return self.skeleton_cards(x0, x1, y, 6, 130, cols=3)
+            if q:
+                return self.empty_state(x0, x1, y, "search", "No matches",
+                                        f"Nothing in this tab matches \"{q}\".")
+            return self.empty_state(x0, x1, y, "shop", "Nothing here yet",
+                                    "Refresh stats while logged in to load what this account "
+                                    "owns.")
         eq_skins = {v.get("skin") for v in (m.get("loadout") or {}).values()}
         return self.item_grid(items, x0, x1, y, h, owner=name, equipped=eq_skins | {
             m.get("card"), m.get("title")}, kind=self.inv_tab)
@@ -9134,12 +10174,9 @@ class App(tk.Tk):
                                      primary=bool(on)) + 10
         y += 48
         if not lg:
-            self.rrect(x0, y, x1, y + 100, 16, fill=SURFACE, outline=LINE)
-            self.text(x0 + 20, y + 36, "No League data yet", 13, "bold")
-            self.text(x0 + 20, y + 64, "Open League of Legends on this account and it loads "
-                                       "automatically (rank, TFT rank and champion mastery).", 10,
-                      fill=MUTED, maxw=bw - 40)
-            return y + 110
+            return self.empty_state(x0, x1, y, "game", "No League data yet",
+                                    "Open League of Legends on this account and it loads "
+                                    "automatically (rank, TFT rank and champion mastery).") + 10
         DDRAGON.ensure() if DDRAGON.version else threading.Thread(
             target=lambda: (DDRAGON.ensure(), self.call_ui(self.redraw)), daemon=True).start()
         self.rrect(x0, y, x1, y + 96, 16, fill=SURFACE, outline=LINE)
@@ -9230,9 +10267,9 @@ class App(tk.Tk):
             y += 50
         eq = {str(k).lower(): v for k, v in (m.get("loadout") or {}).items()}
         if not eq:
-            self.text((x0 + x1) / 2, y + 40, "No loadout loaded yet. Refresh stats while logged "
-                                             "in.", 11, fill=MUTED, anchor="center")
-            return y + 80
+            return self.empty_state(x0, x1, y, "shield", "No loadout loaded yet",
+                                    "Refresh stats while logged in to see what's equipped on "
+                                    "every weapon.")
         weapons = sorted(ASSETS.weapons.items(), key=lambda kv: (
             WEAPON_ORDER.index(kv[1]["name"]) if kv[1]["name"] in WEAPON_ORDER else 99))
         cw, ch, gap = 200, 128, 12
@@ -9359,9 +10396,7 @@ class App(tk.Tk):
 
     def draw_collections(self, name, m, x0, x1, y, h, active):
         if not ASSETS.ready:
-            self.text((x0 + x1) / 2, y + 40, "Loading game data…", 11, fill=MUTED,
-                      anchor="center")
-            return y + 80
+            return self.skeleton_cards(x0, x1, y, 6, 150)
         cols = collections(m)
         q = self.search_var.get().strip().lower()
         if q:
@@ -9427,18 +10462,24 @@ class App(tk.Tk):
                                tip="Hide other players' ranks so you just play")
         y += 62
         if not active:
-            self.text((x0 + x1) / 2, y + 60, "Log into an account to use the live view.", 12,
-                      fill=MUTED, anchor="center")
+            self.empty_state(x0, x1, y, "game", "Nobody's logged in",
+                             "Log into an account and your party, queue and lobby ranks show "
+                             "up here.", ("Go to accounts", lambda: self.set_page("home"),
+                                          "live:go", "person"))
             return
         d = self.live
         if self.live_error and not d:
-            self.rrect(x0, y, x1, y + 90, 16, fill=SURFACE, outline=LINE)
-            self.text(x0 + 20, y + 32, "Couldn't reach the live game service", 12, "bold")
-            self.text(x0 + 20, y + 58, self.live_error, 9, fill=MUTED, maxw=bw - 40)
-            self.finish_scroll(top, y + 100, h)
+            y = self.empty_state(x0, x1, y, "warning", "Couldn't reach the live game service",
+                                 self.live_error, ("Try again", self.refresh_live, "live:retry",
+                                                   "refresh"), tone=GOLD)
+            self.finish_scroll(top, y + 10, h)
             return
         if not d:
-            self.text((x0 + x1) / 2, y + 60, "Loading…", 12, fill=MUTED, anchor="center")
+            self.rrect(x0, y, x1, y + 120, 18, fill=SURFACE, outline=LINE)
+            self.skel(x0 + 24, y + 24, x0 + 150, y + 40, 8)
+            self.skel(x0 + 24, y + 54, x0 + 260, y + 78, 8, 1)
+            self.skel(x0 + 24, y + 90, x0 + 180, y + 102, 6, 2)
+            self.skeleton_rows(x0, x1, y + 140, 3)
             if not self.live_busy:
                 self.after(10, self.refresh_live)
             return
@@ -9558,13 +10599,7 @@ class App(tk.Tk):
         n = len(d.get("party") or [])
         q = d.get("queue") or ""
         if queueing:
-            since = 0
-            try:
-                since = time.time() - datetime.fromisoformat(
-                    str(d.get("queue_since")).replace("Z", "+00:00")).timestamp()
-            except Exception:
-                since = time.time() - d.get("t", time.time())
-            since = max(0, since)
+            since = queue_elapsed(d)
             self.text(x0 + 24, y + 40, f"Finding a match · {int(since // 60)}:{int(since % 60):02d}",
                       18, "bold", ACCENT_HI)
             self._more = self._more or self.settings.get("animations", True)
@@ -9907,6 +10942,7 @@ class App(tk.Tk):
                            ("servers", "Server status")], self.soc_tab, self.set_soc_tab, "soct",
                    size=10, h=34)
         y += 54
+        self.mark_tab_content(y)
         if self.soc_tab == "leaderboard":
             y = self.draw_leaderboard(x0, x1, y, h)
         elif self.soc_tab == "servers":
@@ -9916,6 +10952,10 @@ class App(tk.Tk):
         self.finish_scroll(top, y + 10, h)
 
     def set_soc_tab(self, t):
+        if t != self.soc_tab:
+            order = ["friends", "leaderboard", "servers"]
+            self.tab_switched((order.index(t) if t in order else 0)
+                              - (order.index(self.soc_tab) if self.soc_tab in order else 0))
         self.soc_tab = t
         self.reset_scroll()
         self.redraw()
@@ -9938,7 +10978,14 @@ class App(tk.Tk):
         self.action_button(x1, y - 2, "Refresh", self.refresh_social, "soc:refresh", "refresh",
                            anchor="e", primary=False, h=30)
         y += 44
-        if self.friends_err:
+        if self.friends is None and not self.friends_err:
+            self.skeleton_rows(x0, x1, y, 4)
+            return y + 4 * 58 + 12
+        if self.friends_err and not fr:
+            y = self.empty_state(x0, x1, y, "chat", "Friends aren't available right now",
+                                 self.friends_err, ("Refresh", self.refresh_social,
+                                                    "soc:retry", "refresh")) + 14
+        elif self.friends_err:
             self.rrect(x0, y, x1, y + 56, 14, fill=SURFACE, outline=LINE)
             self.icon(x0 + 24, y + 28, "info", 12, MUTED)
             self.text(x0 + 46, y + 28, self.friends_err, 10, fill=MUTED, maxw=bw - 70)
@@ -10044,8 +11091,8 @@ class App(tk.Tk):
         y += 50
         data = self.srv["data"].get(reg)
         if data is None:
-            self.text(x0, y + 20, "Checking Riot's status pages…", 11, fill=MUTED)
-            return y + 50
+            self.text(x0 + 4, y + 8, "Checking Riot's status pages…", 9, "bold", DIM)
+            return self.skeleton_rows(x0, x1, y + 24, 2, 64, avatar=False) + 10
         for g, title in (("val", "VALORANT"), ("lol", "League of Legends / TFT")):
             items = data.get(g)
             issues = status_issues(items)
@@ -10077,7 +11124,7 @@ class App(tk.Tk):
                 tags = self.hit(k, click=lambda k=k: (self.srv["open"].symmetric_difference_update(
                     {k}), self.redraw()), box=(x0 + 18, y, x0 + 18 + tw, y + 26))
                 self.rrect(x0 + 18, y, x0 + 18 + tw, y + 26, 13,
-                           fill=self.hcol(k, SURFACE, CARD), tags=tags)
+                           fill=self.hcol(k, CARD, CARD_HI), tags=tags)
                 self.text(x0 + 31, y + 13, lab, 8, "bold", self.hcol(k, DIM, TEXT), tags=tags)
                 y += 34
                 if opened:
@@ -10187,16 +11234,12 @@ class App(tk.Tk):
                                "lb:paste", "copy", primary=False, h=30)
             return y + 136
         if lb["busy"] and not lb["rows"]:
-            for i in range(8):
-                self.rrect(x0, y + i * 52, x1, y + i * 52 + 44, 12,
-                           fill=mix(SURFACE, CARD, 0.5 + 0.5 * math.sin(time.time() * 3 + i)))
-            self._more = True
-            return y + 8 * 52
+            return self.skeleton_rows(x0, x1, y, 8, 52)
         if lb["err"] and not lb["rows"]:
-            self.rrect(x0, y, x1, y + 60, 14, fill=SURFACE, outline=LINE)
-            self.text(x0 + 20, y + 30, f"Couldn't load the leaderboard: {lb['err']}", 10,
-                      fill=MUTED, maxw=bw - 40)
-            return y + 76
+            return self.empty_state(x0, x1, y, "trophy", "Couldn't load the leaderboard",
+                                    str(lb["err"]), ("Try again",
+                                                     lambda: self.load_leaderboard(),
+                                                     "lb:retry", "refresh"), tone=GOLD) + 10
         rows = lb["rows"] or []
         mine = {self.m(n).get("puuid") for n in self.accounts() if self.m(n).get("puuid")}
         sub = f"{ASSETS.current_act_label or 'This act'}  ·  {STATUS_REGIONS.get(reg, reg)}"
@@ -10986,6 +12029,11 @@ class App(tk.Tk):
                 ("about", "info", "About")]
 
     def set_set_tab(self, t):
+        if t != getattr(self, "set_tab", None):
+            keys = [k for k, _, _ in self.SET_TABS]
+            cur = getattr(self, "set_tab", "appearance")
+            self.tab_switched((keys.index(t) if t in keys else 0)
+                              - (keys.index(cur) if cur in keys else 0))
         self.set_tab = t
         self.reset_scroll()
         self.redraw()
@@ -10999,19 +12047,28 @@ class App(tk.Tk):
         tab = getattr(self, "set_tab", "appearance")
         # left category list (stays put while the panel scrolls)
         ny = 96
+        keys = [k for k, _, _ in self.SET_TABS]
+        if tab in keys:      # the active highlight glides between categories
+            ay = self.tween("stab:y", 96 + 46 * keys.index(tab), 0.36, "back")
+            self.soft(X0, ay, X0 + 188, ay + 40, 12, ACCENT, alpha=55, spread=10, dy=2)
+            self.rrect(X0, ay, X0 + 188, ay + 40, 12, fill=mix(SURFACE, ACCENT, 0.28), depth=1.0)
+            self.rrect(X0 + 6, ay + 12, X0 + 9, ay + 28, 1.5, fill=ACCENT_HI, depth=0)
         for k, ic, lab in self.SET_TABS:
             key = "stab:" + k
             on = tab == k
             hov = self.hover == key
             tags = self.hit(key, click=lambda k=k: self.set_set_tab(k),
                             box=(X0, ny, X0 + 188, ny + 40))
-            if on or hov:
-                self.rrect(X0, ny, X0 + 188, ny + 40, 12, fill=mix(SURFACE, ACCENT, 0.28) if on
-                           else CARD, tags=tags)
-            self.icon(X0 + 22, ny + 20, ic, 11, SOFT if on else (self.hcol(key, MUTED, TEXT, hov)),
-                      tags=tags)
-            self.text(X0 + 42, ny + 20, lab, 10, "bold", TEXT if on else self.hcol(key, MUTED, TEXT, hov), tags=tags)
+            if not on:
+                self.hover_bg(X0, ny, X0 + 188, ny + 40, 12, key, base=mix(BG, SURFACE, 0.5),
+                              hot=CARD, tags=tags)
+            dx = 0 if on else round(2 * self.hv(key), 1)
+            self.icon(X0 + 22 + dx, ny + 20, ic, 11,
+                      SOFT if on else (self.hcol(key, MUTED, TEXT, hov)), tags=tags)
+            self.text(X0 + 42 + dx, ny + 20, lab, 10, "bold",
+                      TEXT if on else self.hcol(key, MUTED, TEXT, hov), tags=tags)
             ny += 46
+        self.mark_tab_content(90)
         x0 = X0 + 212
         x1 = min(w - 32, x0 + 720)
         bw = x1 - x0
@@ -11032,7 +12089,8 @@ class App(tk.Tk):
             for n, r in enumerate(rows):
                 ry = y + n * RH
                 if n:
-                    self.cv.create_line(x0 + 18, ry, x1 - 18, ry, fill=LINE)
+                    self.cv.create_line(x0 + 18, ry, x1 - 18, ry,
+                                        fill=mix(LINE, "#ffffff", 0.045))
                 kind = r[0]
                 if kind == "toggle":
                     _, key, ttl, sub_, enabled = (r + (True,))[:5]
@@ -11040,18 +12098,13 @@ class App(tk.Tk):
                     hov = self.hover == k and enabled
                     tags = self.hit(k, click=(lambda key=key: self.toggle(key)) if enabled
                                     else None)
-                    self.rrect(x0 + 4, ry + 4, x1 - 4, ry + RH - 4, 12,
-                               fill=self.hcol(k, SURFACE, CARD, hov), tags=tags)
+                    if enabled:
+                        self.hover_bg(x0 + 4, ry + 4, x1 - 4, ry + RH - 4, 12, k, tags=tags)
                     self.text(x0 + 20, ry + 22, ttl, 10, "bold", TEXT if enabled else DIM,
                               tags=tags)
                     self.text(x0 + 20, ry + 41, sub_, 8, fill=MUTED, maxw=bw - 110, tags=tags)
                     on = bool(self.settings.get(key, False)) and enabled
-                    sx = x1 - 64
-                    t = round(self.tween("tog:" + key, 1.0 if on else 0.0, 0.2) * 10) / 10
-                    self.rrect(sx, ry + 20, sx + 42, ry + 42, 11, fill=mix(CARD_HI, ACCENT, t),
-                               tags=tags)
-                    self.circle(sx + 11 + 20 * t, ry + 31, 8, fill=mix(MUTED, "#ffffff", t),
-                                tags=tags)
+                    self.toggle_switch(x1 - 64, ry + 31, on, k, tags, enabled)
                 elif kind == "choice":
                     _, ttl, sub_, options, current, pick, key = r
                     self.text(x0 + 20, ry + 22, ttl, 10, "bold")
@@ -11064,8 +12117,7 @@ class App(tk.Tk):
                     k = "row:" + key
                     hov = self.hover == k
                     tags = self.hit(k, click=fn)
-                    self.rrect(x0 + 4, ry + 4, x1 - 4, ry + RH - 4, 12,
-                               fill=self.hcol(k, SURFACE, CARD, hov), tags=tags)
+                    self.hover_bg(x0 + 4, ry + 4, x1 - 4, ry + RH - 4, 12, k, tags=tags)
                     self.rrect(x0 + 16, ry + 15, x0 + 48, ry + 47, 10,
                                fill=self.hcol(k, CARD_HI, ACCENT, hov), tags=tags)
                     self.icon(x0 + 32, ry + 31, ic, 11, TEXT, tags=tags)
@@ -11081,17 +12133,26 @@ class App(tk.Tk):
             y += 28
             self.rrect(x0, y, x1, y + 120, 16, fill=SURFACE, outline=LINE)
             tx = x0 + 24
+            n_sw = len([k for k in THEMES if k != "Custom"]) + 1
+            sw_step = max(56, min(76, (x1 - x0 - 48) / n_sw))
             for name, pal in [(k, v) for k, v in THEMES.items() if k != "Custom"]:
                 key = "theme:" + name
                 on = st.get("theme") == name
                 hov = self.hover == key
                 tags = self.hit(key, click=lambda n=name: self.set_theme(n), tip=name)
-                if on:
-                    self.circle(tx + 22, y + 50, 27, fill="", outline=TEXT, width=2)
-                self.circle(tx + 22, y + 50, (22 + (23 - 22) * self.hv(key, hov)), fill=pal[4], tags=tags)
-                self.circle(tx + 22, y + 50, 13, fill=pal[0], tags=tags)
+                f_ = self.hv(key, hov)
+                ring = self.tween("thring:" + name, 1.0 if on else 0.0, 0.3, "back")
+                if f_ > 0 or ring > 0.05:
+                    self.soft(tx, y + 28, tx + 44, y + 72, 22, pal[0],
+                              alpha=int(60 * max(f_, ring)), spread=10, dy=2)
+                if ring > 0.05:
+                    self.circle(tx + 22, y + 50, 23 + 4 * ring, fill="",
+                                outline=mix(BG, TEXT, ring), width=2)
+                self.circle(tx + 22, y + 50, 22 + 1.5 * f_ - self.pressed(key), fill=pal[4],
+                            tags=tags, depth=0.8)
+                self.circle(tx + 22, y + 50, 13 + 1.5 * f_, fill=pal[0], tags=tags, depth=1.0)
                 self.text(tx + 22, y + 94, name, 8, "bold", TEXT if on else DIM, anchor="center")
-                tx += 76
+                tx += sw_step
             key = "theme:pick"
             hov = self.hover == key
             tags = self.hit(key, click=self.open_color_picker, tip="Pick any colour")
@@ -11112,6 +12173,8 @@ class App(tk.Tk):
                  [("grid", "Tiles"), ("list", "List")], st.get("layout"),
                  lambda v: self.set_setting("layout", v), "lay"),
                 ("toggle", "animations", "Animations", "Smooth page and pop-up transitions"),
+                ("toggle", "ui_sounds", "Interface sounds",
+                 "Very quiet clicks and chimes for switching, toggles and alerts"),
                 ("toggle", "rank_glow", "Rank-coloured glow",
                  "The background glow takes on the selected account's rank colour"),
                 ("link", "bgimg", "palette", "Remove background image" if st.get("bg_image")
@@ -11164,6 +12227,8 @@ class App(tk.Tk):
                  "Brings the whole app up instead (when the mini picker is off)"),
                 ("toggle", "live_alerts", "Match alerts",
                  "Notification when agent select starts"),
+                ("toggle", "match_sound", "Match found sound",
+                 "Plays a chime and flashes the taskbar, so you don't miss it while tabbed out"),
                 ("toggle", "focus_mode", "Focus mode",
                  "Hides other players' ranks so you just play"),
             ], "VALORANT")
@@ -11316,6 +12381,9 @@ class App(tk.Tk):
         return None
 
     def on_motion(self, e):
+        if self.kbd_focus and abs(e.x - self.mouse[0]) + abs(e.y - self.mouse[1]) > 3:
+            self.kbd_focus = False      # mouse is back: hide the keyboard focus ring
+            self.redraw()
         self.mouse = (e.x, e.y)
         self.set_hover(self.current_key())
 
@@ -11336,8 +12404,11 @@ class App(tk.Tk):
         if fn:
             fn(event) if kind == "right" else fn()
 
+    # Clicks fire on release (like every native control) so buttons can show a pressed
+    # state and a press can be cancelled by dragging off. Menus still fire on press.
     def on_press(self, e):
         self.cv.focus_set()
+        self.mouse = (e.x, e.y)
         key = self.current_key()
         if self.pop:
             if key and key.startswith("pop:"):
@@ -11347,7 +12418,9 @@ class App(tk.Tk):
             return
         self.press = (key, e.x, e.y)
         self.dragging = None
-        self.fire("click")
+        self.press_t = time.time()
+        if key and (self.hits.get(key) or {}).get("click"):
+            self.redraw()
 
     def on_drag(self, e):
         if not self.press:
@@ -11379,6 +12452,14 @@ class App(tk.Tk):
         return best
 
     def on_release(self, e):
+        pk = self.press[0] if self.press else None
+        if pk and not self.dragging:
+            self.mouse = (e.x, e.y)
+            if self.current_key() == pk:
+                self.press = None
+                self.fire("click")
+                self.redraw()
+                return
         if self.dragging:
             name = self.dragging
             idx = self.drop_index()
@@ -11392,6 +12473,7 @@ class App(tk.Tk):
             self.cv.config(cursor="")
             self.redraw()
         self.press = None
+        self.redraw()
 
     def on_wheel(self, e):
         try:
@@ -11484,10 +12566,18 @@ class App(tk.Tk):
         self.expanded = None
         self.redraw()
 
+    def page_index(self, p):
+        order = [x for x, _, _ in self.PAGES] + ["settings"]
+        return order.index(p) if p in order else len(order)
+
     def set_page(self, p):
         if p != self.page:
             self.search_var.set("")
             self.page_t = time.time()
+            self.page_dir = 1 if self.page_index(p) >= self.page_index(self.page) else -1
+            self.reset_anims("cnt:", "bar:")
+            self._tab_mark = None
+            self.play_ui("tap")
         self.page = p
         self.cv.focus_set()
         self.redraw()
@@ -11497,15 +12587,25 @@ class App(tk.Tk):
             self.selected = name
         self.set_page("profile")
 
+    PTABS = ["overview", "matches", "inventory", "loadout", "collections", "league"]
+
     def set_ptab(self, t):
+        if t != self.ptab:
+            a = self.PTABS.index(self.ptab) if self.ptab in self.PTABS else 0
+            b = self.PTABS.index(t) if t in self.PTABS else 0
+            self.tab_switched(b - a)
         self.ptab = t
         self.search_var.set("")
         self.redraw()
 
     def set_inv_tab(self, t):
+        if t != self.inv_tab:
+            self.tab_switched()
         self.inv_tab = t
         self.weapon = "All"
         self.redraw()
+
+    RANKED_CHIP = "__ranked__"
 
     def set_tag_filter(self, t):
         self.tag_filter = t
@@ -11602,6 +12702,7 @@ class App(tk.Tk):
                 return
         self.settings[key] = val
         save_state(self.state_)
+        self.play_ui("toggle")
         if key == "hotkeys":
             self.apply_hotkeys()
             if self.tray:
@@ -11687,6 +12788,19 @@ class App(tk.Tk):
             if prev and prev in self.accounts() and prev != self.state_.get("active"):
                 yield pystray.MenuItem(f"Switch back to {prev}",
                                        lambda i, it: self.call_ui(self.switch_back))
+            d = self.live or {}
+            if d.get("party_id") and d.get("phase") == "none":
+                yield pystray.Menu.SEPARATOR
+                if self.queueing():
+                    yield pystray.MenuItem("Stop queue", lambda i, it: self.call_ui(
+                        lambda: self.party_do("leave")))
+                else:
+                    q = d.get("queue") or ""
+                    yield pystray.MenuItem(f"Start queue ({QUEUES.get(q, q.title() or 'Custom')})",
+                                           lambda i, it: self.call_ui(lambda: self.party_do("join")))
+                yield pystray.MenuItem("Party open", lambda i, it: self.call_ui(
+                    lambda: self.party_do("access", not (self.live or {}).get("party_open"))),
+                    checked=lambda it: bool((self.live or {}).get("party_open")))
             yield pystray.Menu.SEPARATOR
             yield pystray.MenuItem("Offline mode", lambda i, it: self.call_ui(
                 self.toggle_offline_mode), checked=lambda it: self.offline_on())
@@ -11786,8 +12900,9 @@ class App(tk.Tk):
         elif abs(d) == 4:
             w = self.cv.winfo_width() - self.SIDE - 36 - (self.RIGHT + 44
                                                          if self.cv.winfo_width() >= 1060 else 32)
-            d = (d // 4) * max(1, int((w + 22) // (self.TILE + 22)))
+            d = (d // 4) * max(1, int((w - self.TILE_PAD + 30) // (self.TILE + 30)))
         i = names.index(self.selected) if self.selected in names else -1
+        self.kbd_focus = True
         self.select(names[max(0, min(len(names) - 1, i + d))])
 
     def nav_enter(self):
@@ -13039,6 +14154,9 @@ class App(tk.Tk):
                             threading.Thread(target=lambda: setattr(
                                 self, "enc", encounter_index(me)), daemon=True).start()
                     if data["phase"] == "pregame" and prev_phase != "pregame":
+                        if self.settings.get("match_sound"):
+                            threading.Thread(target=play_chime, daemon=True).start()
+                            flash_taskbar(self)
                         if self.settings.get("agent_picker", True):
                             self.open_picker()
                         elif self.settings.get("auto_live"):
@@ -13063,17 +14181,27 @@ class App(tk.Tk):
             self.call_ui(apply)
         threading.Thread(target=work, daemon=True).start()
 
+    def queueing(self):
+        d = self.live or {}
+        return d.get("phase") == "none" and str(d.get("party_state", "")).upper() == "MATCHMAKING"
+
     def _live_tick(self):
         on_page = self.page == "live" and not self.is_hidden()
         in_select = (self.live or {}).get("phase") == "pregame"
         picking = bool(self.picker) and in_select
-        self.after(2500 if picking else 3000 if on_page and in_select else 8000 if on_page
-                   else 20000, self._live_tick)
+        queueing = self.queueing()
+        self.after(2500 if picking else 3000 if (on_page and in_select) or queueing
+                   else 6000 if on_page or self.mini else 20000, self._live_tick)
         if not self.state_.get("active"):
             return
-        if on_page or picking:
+        if self.mini and "valorant" in self.running_games and not (on_page or picking or queueing):
             self.refresh_live()
-        elif (self.settings.get("live_alerts") or self.settings.get("overlay")
+            return
+        if on_page or picking or queueing:
+            self.refresh_live(notify=queueing and not on_page
+                              and bool(self.settings.get("live_alerts")))
+        elif (self.settings.get("live_alerts") or self.settings.get("match_sound")
+              or self.settings.get("overlay")
               or self.settings.get("auto_live") or self.settings.get("agent_picker", True)):
             def check():
                 if "VALORANT" in games_running():
@@ -13389,6 +14517,7 @@ class App(tk.Tk):
             im = Image.blend(im, Image.new("RGB", (w, h), (r, g, b)), 0.62)
             ph = ImageTk.PhotoImage(im)
             self.bg_photo = (key, ph)
+            self._bg_pil = im
             return ph
         except Exception:
             return None

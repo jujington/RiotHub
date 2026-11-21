@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest something new for RiotHub
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like?
+      description: Describe the feature and what problem it solves for you.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of RiotHub?
+      options:
+        - Accounts / switching
+        - Play / game launcher
+        - VALORANT stats & profile
+        - Store & wishlist
+        - Live match & party
+        - Friends & chat
+        - Settings / other
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Mockups, examples from other apps, etc.

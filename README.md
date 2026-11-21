@@ -26,10 +26,24 @@
 - Daily shop, night market and bundles for every account, with wishlist alerts
 - Inventory, loadouts, skin previews with in-app video, inventory value
 - Live lobby ranks in agent select and in game (hidden names stay hidden)
+- Party controls: see who's in your party, start or stop queue, change mode, open or close the party — from the app, the tray or the mini overlay
+- Optional match-found sound and taskbar flash for when you're tabbed out
+- "Ranked ready" badges show which accounts can queue competitive right now
 - Copy crosshair, keybinds and settings between accounts
 - Weekly missions and battle pass progress across all your accounts
 - Penalty details with countdowns, server status, leaderboard, friends and chat
 - Appear offline, themes, tray icon, hotkeys, encrypted backups
+
+## Screenshots
+
+<p align="center">
+  <img src="assets/screenshots/accounts.png" width="49%" alt="Accounts">
+  <img src="assets/screenshots/profile.png" width="49%" alt="Profile">
+</p>
+<p align="center">
+  <img src="assets/screenshots/store.png" width="49%" alt="Store">
+  <img src="assets/screenshots/live.png" width="49%" alt="Live match">
+</p>
 
 ## Install
 
@@ -65,18 +79,11 @@ py -m pip install -r requirements.txt
 build.bat
 ```
 
-The app ends up in `dist\RiotHub.exe`.
+You get the portable `dist\RiotHub.exe` and the faster-starting `dist\app\RiotHub\` folder the installer uses. Compile `installer.iss` with [Inno Setup](https://jrsoftware.org/isinfo.php) to make the installer.
 
 ## Making a release (for maintainers)
 
-Push a tag that starts with `v` and GitHub builds everything for you:
-
-```bat
-git tag v11.1
-git push origin v11.1
-```
-
-GitHub Actions builds `RiotHub.exe` and `RiotHub Setup.exe` and attaches them to a new release. Everyone's RiotHub sees it and offers the update.
+On GitHub, go to **Releases → Draft a new release**, create a new tag that's higher than the last one (like `v1.1.0`) and publish. GitHub Actions builds `RiotHub.exe` and `RiotHub Setup.exe` and attaches them to the release within a few minutes, and everyone's RiotHub offers the update.
 
 ## Legal
 

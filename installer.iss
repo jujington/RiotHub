@@ -1,5 +1,5 @@
 ; Inno Setup script - builds "RiotHub Setup.exe"
-; 1) Build the app first:  build.bat
+; 1) Build the app first:  build.bat  (makes dist\app\RiotHub\)
 ; 2) Install Inno Setup (free): https://jrsoftware.org/isinfo.php
 ; 3) Right-click this file > Compile  (or: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss)
 ; The finished installer appears in the "installer" folder.
@@ -7,7 +7,7 @@
 
 #define MyAppName "RiotHub"
 #ifndef MyAppVersion
-  #define MyAppVersion "11.0"
+  #define MyAppVersion "1.0.0"
 #endif
 #define MyAppPublisher "RiotHub"
 #define MyExeName "RiotHub.exe"
@@ -37,7 +37,12 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Name: "startup"; Description: "Start with Windows (in the tray)"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "dist\{#MyExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; The folder build starts much faster than the single-file exe (nothing to unpack each launch).
+Source: "dist\app\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; Clear out the previous version's bundled libraries so nothing stale is left behind.
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyExeName}"
