@@ -34,17 +34,6 @@
 - Penalty details with countdowns, server status, leaderboard, friends and chat
 - Appear offline, themes, tray icon, hotkeys, encrypted backups
 
-## Screenshots
-
-<p align="center">
-  <img src="assets/screenshots/accounts.png" width="49%" alt="Accounts">
-  <img src="assets/screenshots/profile.png" width="49%" alt="Profile">
-</p>
-<p align="center">
-  <img src="assets/screenshots/store.png" width="49%" alt="Store">
-  <img src="assets/screenshots/live.png" width="49%" alt="Live match">
-</p>
-
 ## Install
 
 1. Download **RiotHub Setup.exe** from the [latest release](../../releases/latest) and run it.
