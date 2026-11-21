@@ -45,6 +45,7 @@ import ctypes
 import hashlib
 import hmac
 import io
+import itertools
 import json
 import os
 import queue
@@ -89,7 +90,7 @@ except Exception:
 
 APP_NAME = "RiotHub"
 OLD_APP_NAMES = ["RiotAccountSwitcher"]      # data folders from before the rename
-VERSION = "1.2.0"   # stamped from the release tag by the GitHub workflow
+VERSION = "1.3.0"   # stamped from the release tag by the GitHub workflow
 APP_TITLE = "RiotHub"
 # GitHub "owner/repo" whose releases this app updates from. Leave empty to turn updates off.
 UPDATE_REPO = ""
@@ -2364,7 +2365,8 @@ def slim_match(d):
                          "competitiveTier": p.get("competitiveTier"),
                          "stats": p.get("stats"), "partyId": p.get("partyId"),
                          "gameName": p.get("gameName"), "tagLine": p.get("tagLine"),
-                         "playerCard": p.get("playerCard")}
+                         "playerCard": p.get("playerCard"),
+                         "accountLevel": p.get("accountLevel")}
                         for p in d.get("players") or []]}
 
 
@@ -2515,10 +2517,11 @@ def fetch_friends(lf):
         any_p = val or (ps[0] if ps else None)
         state = (any_p or {}).get("state") or "offline"
         detail = ""
+        pres = {}
         if val:
             priv = decode_private(val.get("private"))
-            loop = (priv.get("sessionLoopState") or
-                    (priv.get("matchPresenceData") or {}).get("sessionLoopState") or "")
+            pres = presence_info(priv)
+            loop = pres.get("loop") or ""
             detail = {"MENUS": "In menus", "PREGAME": "Agent select",
                       "INGAME": "In a match"}.get(loop, "")
         elif any_p:
@@ -2527,8 +2530,100 @@ def fetch_friends(lf):
         out.append({"puuid": f.get("puuid"), "pid": f.get("pid"),
                     "name": f"{f.get('game_name') or f.get('name') or '?'}#{f.get('game_tag') or ''}",
                     "state": "offline" if not ps else state, "detail": detail,
-                    "online": bool(ps) and state not in ("offline",)})
+                    "online": bool(ps) and state not in ("offline",),
+                    "product": (any_p or {}).get("product") or "", "pres": pres,
+                    "note": f.get("note") or ""})
     out.sort(key=lambda x: (not x["online"], x["name"].lower()))
+    return out
+
+
+def presence_info(priv):
+    """The useful bits of a VALORANT presence. Riot has used a flat layout and a nested one
+    (playerPresenceData / matchPresenceData / partyPresenceData); read whichever is there.
+    Anything missing stays missing - nothing is guessed."""
+    pp = priv.get("playerPresenceData") or {}
+    mp = priv.get("matchPresenceData") or {}
+    party = priv.get("partyPresenceData") or {}
+
+    def pick(*vals):
+        for v in vals:
+            if v not in (None, ""):
+                return v
+        return None
+    out = {
+        "tier": pick(pp.get("competitiveTier"), priv.get("competitiveTier")),
+        "level": pick(pp.get("accountLevel"), priv.get("accountLevel")),
+        "card": pick(pp.get("playerCardId"), priv.get("playerCardId")),
+        "title": pick(pp.get("playerTitleId"), priv.get("playerTitleId")),
+        "loop": pick(mp.get("sessionLoopState"), priv.get("sessionLoopState")),
+        "map": pick(mp.get("matchMap"), priv.get("matchMap"), priv.get("partyOwnerMatchMap")),
+        "queue": pick(mp.get("queueId"), priv.get("queueId")),
+        "party_size": pick(party.get("partySize"), priv.get("partySize")),
+        "ally": pick(party.get("partyOwnerMatchScoreAllyTeam"),
+                     priv.get("partyOwnerMatchScoreAllyTeam")),
+        "enemy": pick(party.get("partyOwnerMatchScoreEnemyTeam"),
+                      priv.get("partyOwnerMatchScoreEnemyTeam")),
+        "lb": pick(pp.get("leaderboardPosition"), priv.get("leaderboardPosition")),
+    }
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def fetch_player_profile(vc, puuid, n_matches=8, stop=None):
+    """Rank, act history, RR movement and recent competitive matches for any player on your
+    region, read with your own signed-in session (the same endpoints the game uses for the
+    career tab). Each part fails on its own, with the reason, instead of sinking the rest."""
+    out = {"t": time.time(), "puuid": puuid, "errors": {}, "matches": []}
+    try:
+        out["mmr"] = parse_mmr(vc.pd(f"/mmr/v1/players/{puuid}"))
+    except Exception as e:
+        out["errors"]["rank"] = describe_err(e)
+        out["errors"]["rank_code"] = getattr(e, "code", None)
+    try:
+        cu = vc.pd(f"/mmr/v1/players/{puuid}/competitiveupdates?startIndex=0&endIndex=20"
+                   "&queue=competitive") or {}
+        out["updates"] = parse_comp_updates(cu)
+    except Exception as e:
+        out["errors"]["history"] = describe_err(e)
+        out["updates"] = []
+    recent = sorted(out["updates"], key=lambda u: -u["start"])[:n_matches]
+    MATCH_DIR.mkdir(parents=True, exist_ok=True)
+    failed = 0
+    for u in recent:
+        if stop and stop():
+            break
+        mid = u.get("id")
+        if not mid:
+            continue
+        f = MATCH_DIR / f"{mid}.json"
+        d = None
+        if f.exists():
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                d = None
+        if d is None:
+            try:
+                d = slim_match(vc.pd(f"/match-details/v1/matches/{mid}", timeout=20))
+                f.write_text(json.dumps(d), encoding="utf-8")
+                time.sleep(0.2)
+            except Exception as e:
+                failed += 1
+                out["errors"]["matches"] = describe_err(e)
+                continue
+        sm = summarize_match(d, puuid, u.get("delta"))
+        if not sm:
+            continue
+        sm["tier_after"], sm["rr_after"] = u.get("tier"), u.get("rr")
+        me = next((p for p in d.get("players") or [] if p.get("subject") == puuid), {}) or {}
+        sm["card"] = me.get("playerCard")
+        sm["level"] = me.get("accountLevel")
+        if me.get("gameName"):
+            out.setdefault("name", f"{me['gameName']}#{me.get('tagLine', '')}")
+        out["matches"].append(sm)
+    if out["matches"]:
+        out["card"] = out["matches"][0].get("card")
+        out["level"] = out["matches"][0].get("level")
+    out["failed_matches"] = failed
     return out
 
 
@@ -3714,6 +3809,8 @@ def make_ico(path):
     imgs[-1].save(path, sizes=[(x, x) for x in sizes], append_images=imgs[:-1])
 
 
+ICON_CODES_EXTRA = {"volume": "\ue767", "mute": "\ue74f", "stop": "\ue71a",
+                    "fullscreen": "\ue740", "pause": "\ue769"}
 ICON_CODES = {"home": "", "add": "", "save": "", "play": "",
               "edit": "", "delete": "", "sync": "", "folder": "",
               "game": "", "person": "", "bolt": "", "rocket": "",
@@ -3725,6 +3822,8 @@ ICON_CODES = {"home": "", "add": "", "save": "", "play": "",
               "lock": "", "upload": "", "download": "",
               "palette": "", "chat": "", "phone": "", "moon": "",
               "chevron": "", "film": "", "info": "", "tag": ""}
+ICON_FALLBACK_EXTRA = {"volume": "♪", "mute": "×", "stop": "■", "fullscreen": "⛶",
+                       "pause": "‖"}
 ICON_FALLBACK = {"home": "⌂", "add": "+", "save": "↓", "play": "▶", "edit": "✎",
                  "delete": "✕", "sync": "⟳", "folder": "▤", "game": "◆", "person": "●",
                  "bolt": "⚡", "rocket": "➚", "settings": "⚙", "link": "↗", "refresh": "↻",
@@ -3734,6 +3833,8 @@ ICON_FALLBACK = {"home": "⌂", "add": "+", "save": "↓", "play": "▶", "edit"
                  "clock": "◷", "trophy": "♛", "lock": "🔒", "upload": "↑", "download": "↓",
                  "palette": "◐", "chat": "✉", "phone": "▯", "moon": "☾", "chevron": "›",
                  "film": "▶", "info": "i", "tag": "#"}
+ICON_CODES.update(ICON_CODES_EXTRA)
+ICON_FALLBACK.update(ICON_FALLBACK_EXTRA)
 
 
 # ================================================================ images
@@ -4111,7 +4212,7 @@ class RoundField(tk.Canvas):
         fill = mix(CARD, mix(CARD, "#ffffff", 0.03), f)
         rest = mix(LINE, mix(LINE, "#ffffff", 0.08), 1.0 if self._hov else 0.0)
         if HAS_PIL:
-            img = self.app.shape_img(w, 42, 12, fill, mix(rest, ACCENT, f), 1 + 0.6 * f, 0.6)
+            img = self.app.shape_img(w, 42, 12, fill, mix(rest, ACCENT, f), 1 + 0.6 * f, 0)
             self._img = img
             self.create_image(0, 0, image=img, anchor="nw", tags="bg")
         else:
@@ -4311,12 +4412,1162 @@ class Sheet(tk.Frame):
         return x - self.PAD <= ex <= x + w + self.PAD and y - self.PAD <= ey <= y + h + self.PAD
 
 
+class Layer:
+    """A dialog drawn on the main canvas, above the page and below toasts/menus.
+
+    Why not a Tk window or frame: those are separate native widgets, so every open/close
+    needed a screenshot of the app, a blur and several full-window blends, and Tk painted
+    them in idle time - under load they showed up half drawn. A Layer is just canvas items:
+    it redraws on its own (the page underneath is frozen and never re-rendered while it's
+    open), it can't end up half painted, and closing it can't leave widgets behind.
+
+    Subclasses implement draw(x0, y0, x1, y1). Use self.k("name") for hit keys so clicks
+    are routed to the top layer only."""
+    W, H = 560, 420
+    dismiss = True          # click outside / Esc closes it
+    _ids = itertools.count(1)
+
+    def __init__(self, app):
+        self.app = app
+        self.kp = f"L{next(Layer._ids)}:"
+        self.t0 = time.time()
+        self.tc = None              # closing since
+        self.closed = False
+        self.box = (0, 0, 0, 0)
+        self.scroll = self.scroll_t = 0.0
+        self.max_scroll = 0.0
+        self.entries = {}           # name -> (tk.Entry, canvas window id)
+        app.push_layer(self)
+
+    def k(self, name):
+        return self.kp + name
+
+    def size(self, w, h):
+        return min(self.W, w - 48), min(self.H, h - 48)
+
+    def draw(self, x0, y0, x1, y1):
+        pass
+
+    def on_key(self, seq, e):
+        if seq == "<Escape>" and self.dismiss:
+            self.close()
+            return True
+        return False
+
+    def on_wheel(self, delta):
+        if self.max_scroll > 0:
+            self.scroll_t = max(0.0, min(self.max_scroll, self.scroll_t - delta / 120 * 80))
+            self.app.layer_redraw()
+
+    def close(self):
+        if self.tc is None:
+            self.tc = time.time()
+            self.on_closing()
+            self.app.layer_closing(self)
+
+    def on_closing(self):
+        """Stop timers, audio, video... (runs once, as soon as close starts)."""
+
+    def cleanup(self):
+        for ent, wid in self.entries.values():
+            try:
+                self.app.cv.delete(wid)
+                ent.destroy()
+            except tk.TclError:
+                pass
+        self.entries = {}
+
+    # -- helpers for subclasses
+    def glide_scroll(self):
+        """Ease the body scroll towards its target; True while it's still moving."""
+        d = self.scroll_t - self.scroll
+        if abs(d) < 0.5 or not self.app.settings.get("animations", True):
+            self.scroll = self.scroll_t
+            return False
+        self.scroll += d * 0.32
+        self.app._more = True
+        return True
+
+    def entry(self, name, var, x, y, w, h=36, show="", on_return=None, hint=""):
+        """A rounded text field with a real Entry inside (kept alive between frames).
+        Empty and unfocused, it shows its hint instead; clicking the field focuses it."""
+        app = self.app
+        cv = app.cv
+        got = self.entries.get(name)
+        if got is None:
+            ent = tk.Entry(cv, textvariable=var, bg=CARD, fg=TEXT, insertbackground=TEXT,
+                           relief="flat", bd=0, font=(app.UI, 11), highlightthickness=0,
+                           show=show, selectbackground=ACCENT, insertwidth=2)
+            if on_return:
+                ent.bind("<Return>", lambda e: (on_return(), "break")[1])
+            ent.bind("<FocusIn>", lambda e: app.layer_redraw(), add="+")
+            ent.bind("<FocusOut>", lambda e: app.layer_redraw(), add="+")
+            got = (ent, None)
+            self.entries[name] = got
+        ent, wid = got
+        try:
+            focused = app.focus_get() is ent
+        except Exception:
+            focused = False
+        f = app.tween(self.kp + "foc:" + name, 1.0 if focused else 0.0, 0.18)
+        key = self.k("field:" + name)
+        tags = app.hit(key, click=lambda: self.focus(name), box=(x, y, x + w, y + h))
+        app.rrect(x, y, x + w, y + h, 11, fill=CARD, depth=0, tags=tags,
+                  outline=mix(mix(LINE, "#ffffff", 0.06 + 0.06 * app.hv(key)), ACCENT, f),
+                  width=1 + 0.5 * f)
+        geom = (x + 13, y + h / 2, w - 26, h - 12)
+        self._geom = getattr(self, "_geom", {})
+        self._geom[name] = geom
+        show_ent = focused or bool(var.get()) or getattr(self, "_want_focus", None) == name
+        if show_ent:
+            self._place(name)
+        else:
+            if wid:
+                try:
+                    cv.itemconfigure(wid, state="hidden")
+                except tk.TclError:
+                    pass
+            if hint:
+                app.text(x + 14, y + h / 2, hint, 10, fill=DIM, tags=tags)
+        if getattr(self, "_want_focus", None) == name:
+            app.after_idle(lambda: self.focus(name))
+        return ent
+
+    def _place(self, name):
+        cv = self.app.cv
+        ent, wid = self.entries[name]
+        ex, ey, ew, eh = self._geom.get(name, (0, 0, 10, 10))
+        try:
+            if wid is None or not cv.type(wid):
+                wid = cv.create_window(ex, ey, window=ent, anchor="w", width=ew, height=eh,
+                                       tags=("lyrwin",))
+                self.entries[name] = (ent, wid)
+            else:
+                cv.coords(wid, ex, ey)
+                cv.itemconfigure(wid, width=ew, height=eh, state="normal")
+        except tk.TclError:
+            pass
+
+    def hide_entries(self):
+        for ent, wid in self.entries.values():
+            try:
+                if wid:
+                    self.app.cv.itemconfigure(wid, state="hidden")
+            except tk.TclError:
+                pass
+
+    def focus(self, name):
+        got = self.entries.get(name)
+        if not got:
+            self._want_focus = name         # not drawn yet: focus on first draw
+            return
+        self._want_focus = None
+        if name in getattr(self, "_geom", {}):
+            self._place(name)
+        try:
+            got[0].focus_set()
+            got[0].icursor("end")
+        except tk.TclError:
+            pass
+        self.app.layer_redraw()
+
+    def close_btn(self, x, y):
+        app = self.app
+        key = self.k("close")
+        f = app.hv(key)
+        tags = app.hit(key, click=self.close, tip="Close  (Esc)")
+        app.circle(x, y, 15 - app.pressed(key), fill=mix(mix(SURFACE, CARD, 0.5), CARD_HI, f),
+                   tags=tags, depth=0.6)
+        app.icon(x, y, "close", 9, app.hcol(key, MUTED, TEXT), tags=tags)
+
+    def button(self, x, y, label, fn, name, icon=None, primary=True, anchor="w", h=36,
+               disabled=False, danger=False, tip=None):
+        app = self.app
+        key = self.k(name)
+        w = app.measure(label, 10, "bold") + (50 if icon else 34)
+        if anchor == "e":
+            x -= w
+        elif anchor == "center":
+            x -= w / 2
+        tags = app.hit(key, click=None if disabled else fn, tip=tip)
+        f = 0 if disabled else app.hv(key)
+        pr = 0 if disabled else app.pressed(key)
+        if disabled:
+            fill = mix(CARD, SURFACE, 0.4)
+        elif primary:
+            base, hot = (DANGER, mix(DANGER, "#ffffff", 0.14)) if danger else (ACCENT, ACCENT_HI)
+            fill = app.hcol(key, base, hot)
+            if f > 0 and not pr:
+                app.soft(x, y, x + w, y + h, h / 2, base, alpha=int(100 * f), spread=10, dy=3,
+                         tags=tags)
+        else:
+            fill = app.hcol(key, CARD, CARD_HI)
+        ins = 1.5 * pr
+        app.rrect(x + ins, y + ins, x + w - ins, y + h - ins, h / 2, fill=fill, tags=tags,
+                  depth=0 if disabled else 1.0 - 0.5 * pr,
+                  outline="" if primary or disabled else mix(LINE, CARD_HI, f))
+        fg = DIM if disabled else (TEXT if primary else app.hcol(key, SOFT, TEXT))
+        tx = x + 17
+        if icon:
+            app.icon(tx + 6, y + h / 2 + 0.5 * pr, icon, 10, fg, tags=tags)
+            tx += 21
+        app.text(tx, y + h / 2 + 0.5 * pr, label, 10, "bold", fg, tags=tags)
+        return w
+
+    def tabs(self, x, y, options, current, pick, name):
+        """Underlined tabs: the accent bar glides to the selected tab."""
+        app = self.app
+        pos = []
+        cx = x
+        for val, lab in options:
+            tw = app.measure(lab, 10, "bold")
+            pos.append((val, lab, cx, tw))
+            cx += tw + 30
+        for val, lab, px, tw in pos:
+            key = self.k(f"{name}:{val}")
+            on = val == current
+            tags = app.hit(key, click=(lambda v=val: pick(v)) if not on else None,
+                           box=(px - 8, y - 14, px + tw + 8, y + 18))
+            app.text(px, y, lab, 10, "bold", TEXT if on else app.hcol(key, MUTED, TEXT),
+                     tags=tags)
+        sel = next(((px, tw) for v, _, px, tw in pos if v == current), None)
+        if sel:
+            sx = app.tween(self.kp + name + ":x", sel[0], 0.3, "back")
+            sw = app.tween(self.kp + name + ":w", sel[1], 0.3, "back")
+            app.rrect(sx, y + 14, sx + sw, y + 17, 1.5, fill=ACCENT_HI, depth=0)
+        return cx
+
+
+class ScrollBody:
+    """Mixin: a scrolling body inside a Layer. Content is drawn shifted by the scroll, then
+    the panel's own colour is laid over everything outside the viewport (canvas items can't
+    be clipped), and the header/footer are drawn on top of that."""
+
+    def mask(self, x0, y0, x1, y1, top, bottom):
+        app = self.app
+        app.rrect(x0 + 1, y0 + 1, x1 - 1, top, 19, fill=SURFACE, depth=0)
+        if top - 22 > y0 + 20:
+            app.cv.create_rectangle(x0 + 1, top - 22, x1 - 1, top, fill=SURFACE, outline="")
+        app.rrect(x0 + 1, bottom, x1 - 1, y1 - 1, 19, fill=SURFACE, depth=0)
+        if bottom + 22 < y1 - 20:
+            app.cv.create_rectangle(x0 + 1, bottom, x1 - 1, bottom + 22, fill=SURFACE,
+                                    outline="")
+        if self.max_scroll > 0:             # slim scroll indicator
+            track = bottom - top - 16
+            th = max(30, track * (bottom - top) / (bottom - top + self.max_scroll))
+            ty = top + 8 + (track - th) * (self.scroll / max(1, self.max_scroll))
+            app.rrect(x1 - 9, ty, x1 - 5, ty + th, 2, fill=mix(SURFACE, SOFT, 0.3), depth=0)
+
+    def vis(self, ya, yb, top, bottom):
+        """Draw a block of scrolled content? Only if it shows in the viewport *and* sits
+        wholly inside the panel - canvas items can't be clipped, so anything poking past the
+        panel's edge would be visible over the dimmed page."""
+        _, py0, _, py1 = self.box
+        return yb > top and ya < bottom and ya >= py0 + 2 and yb <= py1 - 2
+
+    def row_box(self, key, x0, y0, x1, y1, top, bottom, click, tip=None):
+        """Register a click area only for the part of a row that's actually visible."""
+        vy0, vy1 = max(y0, top), min(y1, bottom)
+        if vy1 - vy0 < 6:
+            return ()
+        return self.app.hit(key, click=click, tip=tip, box=(x0, vy0, x1, vy1))
+
+
+def _stat_label(app, x, y, label, value, col=None, size=13):
+    app.text(x, y, label, 8, "bold", DIM)
+    app.text(x, y + 20, value, size, "bold", col or TEXT)
+
+
+class FriendLayer(Layer, ScrollBody):
+    """A friend's player profile (rank, acts, RR movement, recent competitive games) plus
+    messaging, in one place. Everything shown comes from Riot; when Riot doesn't give
+    something, the panel says so instead of guessing."""
+    W, H = 820, 700
+    CACHE_S = 300
+
+    def __init__(self, app, friend, tab="profile"):
+        self.f = friend
+        self.puuid = friend.get("puuid")
+        self.tab = "chat" if tab == "chat" and friend.get("pid") else (
+            tab if tab in ("profile", "matches") else "profile")
+        cache = app.__dict__.setdefault("friend_profiles", {})
+        got = cache.get(self.puuid)
+        self.data = got if got and time.time() - got.get("t", 0) < self.CACHE_S else None
+        self.loading = False
+        self.var = tk.StringVar(app)
+        self.chat = {"msgs": None, "err": None, "me": None, "sending": False}
+        self.chat_scroll = 0.0
+        self._chat_gen = 0
+        super().__init__(app)
+        if self.data is None:
+            self.load()
+        if self.tab == "chat":
+            self.start_chat()
+
+    # ---- data
+    def load(self, force=False):
+        if self.loading or not self.puuid:
+            return
+        self.loading = True
+        if force:
+            self.data = None
+        app = self.app
+
+        def work():
+            try:
+                vc, _ = app.get_vc()
+                d = fetch_player_profile(vc, self.puuid, stop=lambda: self.tc is not None)
+            except Exception as e:
+                d = {"t": time.time(), "fatal": describe_err(e), "errors": {}, "matches": []}
+
+            def done():
+                self.loading = False
+                if not d.get("fatal"):
+                    app.friend_profiles[self.puuid] = d
+                if not self.closed:
+                    self.data = d
+                    app.layer_redraw()
+            app.call_ui(done)
+        threading.Thread(target=work, daemon=True).start()
+        app.layer_redraw()
+
+    def set_tab(self, t):
+        if t == self.tab:
+            return
+        self.tab = t
+        self.scroll = self.scroll_t = 0
+        if t == "chat":
+            self.start_chat()
+            self.focus("msg")
+        else:
+            self._chat_gen += 1          # stops the chat poll loop
+            self.app.cv.focus_set()
+        self.app.layer_redraw()
+
+    def on_closing(self):
+        self._chat_gen += 1
+
+    # ---- chat
+    def start_chat(self):
+        self._chat_gen += 1
+        gen = self._chat_gen
+        app = self.app
+
+        def poll():
+            if gen != self._chat_gen or self.tc is not None or self.closed:
+                return
+
+            def work():
+                lf = read_lockfile()
+                try:
+                    if not lf:
+                        raise ClientDown("")
+                    if not self.chat["me"]:
+                        self.chat["me"] = local_tokens(lf)[2]
+                    msgs = chat_history(lf, self.f["pid"])
+                    err = None
+                except Exception as e:
+                    msgs, err = None, describe_err(e)
+
+                def done():
+                    if gen != self._chat_gen:
+                        return
+                    if msgs is not None:
+                        sig = [(m.get("id"), m.get("body")) for m in msgs[-40:]]
+                        changed = sig != self.chat.get("sig")
+                        self.chat.update(msgs=msgs[-40:], err=None, sig=sig)
+                    else:
+                        changed = self.chat.get("err") != err
+                        self.chat["err"] = err
+                    if changed:
+                        app.layer_redraw()
+                app.call_ui(done)
+            threading.Thread(target=work, daemon=True).start()
+            app.after(2500, poll)
+        poll()
+
+    def send(self):
+        text = self.var.get().strip()
+        if not text or self.chat["sending"]:
+            return
+        self.var.set("")
+        self.chat["sending"] = True
+        self.chat["pending"] = text
+        app = self.app
+        self.chat_scroll = 0
+        app.layer_redraw()
+
+        def work():
+            try:
+                lf = read_lockfile()
+                if not lf:
+                    raise ClientDown("")
+                chat_send(lf, self.f["pid"], text)
+                msgs = chat_history(lf, self.f["pid"])
+                err = None
+            except Exception as e:
+                msgs, err = None, describe_err(e)
+
+            def done():
+                self.chat["sending"] = False
+                self.chat["pending"] = None
+                if msgs is not None:
+                    self.chat.update(msgs=msgs[-40:], err=None,
+                                     sig=[(m.get("id"), m.get("body")) for m in msgs[-40:]])
+                else:
+                    if not self.var.get():
+                        self.var.set(text)
+                    app.toast(f"Didn't send: {err}", "bad", tray=False)
+                app.layer_redraw()
+            app.call_ui(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- input
+    def on_wheel(self, delta):
+        if self.tab == "chat":
+            self.chat_scroll = max(0.0, self.chat_scroll + delta / 120 * 60)
+            self.app.layer_redraw()
+        else:
+            super().on_wheel(delta)
+
+    # ---- drawing
+    def status_line(self):
+        f, pr = self.f, self.f.get("pres") or {}
+        if not f.get("online"):
+            return "Offline", DIM
+        prod = f.get("product")
+        if prod and prod != "valorant":
+            return {"league_of_legends": "Playing League of Legends",
+                    "bacon": "Playing Legends of Runeterra",
+                    "keystone": "Online in the Riot Client"}.get(prod, "Online"), GOLD
+        loop = pr.get("loop")
+        bits = []
+        if loop == "INGAME":
+            bits.append("In a match")
+        elif loop == "PREGAME":
+            bits.append("In agent select")
+        elif loop == "MENUS":
+            bits.append("In menus")
+        else:
+            bits.append("Online")
+        q = pr.get("queue")
+        if q and loop in ("INGAME", "PREGAME"):
+            bits.append(QUEUES.get(q, str(q).title()))
+        mp = ASSETS.maps.get(pr.get("map") or "", {}).get("name")
+        if mp and loop == "INGAME":
+            bits.append(mp)
+        if loop == "INGAME" and pr.get("ally") is not None and pr.get("enemy") is not None:
+            bits.append(f"{pr['ally']}–{pr['enemy']}")
+        elif loop == "MENUS" and (pr.get("party_size") or 0) > 1:
+            bits.append(f"party of {pr['party_size']}")
+        col = GOOD if f.get("state") in ("chat", "dnd") or loop else GOLD
+        return "  ·  ".join(bits), col
+
+    def draw(self, x0, y0, x1, y1):
+        app = self.app
+        f = self.f
+        pres = f.get("pres") or {}
+        d = self.data or {}
+        name, _, tag = (f.get("name") or "?").partition("#")
+        if app.streamer():
+            name, tag = "Hidden", "•••"
+        body_top = y0 + 226
+        body_bot = y1 - (14 if self.tab == "chat" else 72)
+        bx0, bx1 = x0 + 26, x1 - 26
+        # body first (it scrolls), then masks, then the fixed header/footer on top
+        if self.tab == "chat":
+            self.draw_chat(bx0, body_top + 6, bx1, body_bot, name)
+        else:
+            self.hide_entries()
+            self.glide_scroll()
+            if self.tab == "matches":
+                self.draw_matches(bx0, body_top, bx1, body_bot)
+            else:
+                self.draw_profile(bx0, body_top, bx1, body_bot)
+        self.mask(x0, y0, x1, y1, body_top, body_bot)
+        if self.tab != "chat":
+            app.cv.create_line(x0 + 20, body_bot + 2, x1 - 20, body_bot + 2, fill=LINE)
+            note = ("From Riot's game services, read with your signed-in client. Other players "
+                    "in each match stay anonymous, like the in-game scoreboard.")
+            for i, ln in enumerate(app.wrap(note, 8, bx1 - bx0, max_lines=2)):
+                app.text(bx0, body_bot + 24 + 15 * i, ln, 8, fill=DIM)
+
+        # header: banner, avatar, name, live status
+        card = ASSETS.cards.get(pres.get("card") or d.get("card") or "", {})
+        ban = (x0 + 8, y0 + 8, x1 - 8, y0 + 120)
+        if not app.image(card.get("wide"), ban[0], ban[1], ban[2] - ban[0], ban[3] - ban[1],
+                         mode="cover", radius=14, fade=True):
+            app.rrect(*ban, 14, fill=mix(SURFACE, ACCENT, 0.16), depth=0)
+            app.soft(ban[0] + 60, ban[1] + 10, ban[0] + 360, ban[3] - 10, 40, ACCENT, alpha=60,
+                     spread=30, dy=0)
+        self.close_btn(x1 - 34, y0 + 34)
+        A = 82
+        ax, ay = x0 + 30, y0 + 78
+        app.rrect(ax - 5, ay - 5, ax + A + 5, ay + A + 5, 22, fill=SURFACE, depth=0)
+        if not app.image(card.get("small"), ax, ay, A, A, mode="cover", radius=18):
+            app.letter_avatar(ax, ay, A, name or "?", radius=18)
+        stxt, scol = self.status_line()
+        app.circle(ax + A - 4, ay + A - 4, 10, fill=SURFACE, depth=0)
+        app.circle(ax + A - 4, ay + A - 4, 6.5, fill=scol if f.get("online") else DIM, depth=0)
+        nx = ax + A + 20
+        app.text(nx, y0 + 140, name, 18, "bold", maxw=x1 - nx - 200)
+        nw = min(app.measure(name, 18, "bold"), x1 - nx - 200)
+        app.text(nx + nw + 6, y0 + 143, f"#{tag}", 11, fill=MUTED)
+        app.text(nx, y0 + 168, stxt, 10, "bold", scol if f.get("online") else DIM,
+                 maxw=x1 - nx - 40)
+        # badges on the right: level and the rank they're showing
+        rx = x1 - 30
+        lvl = pres.get("level") or d.get("level")
+        tier = pres.get("tier")
+        if tier is None and d.get("mmr"):
+            tier = d["mmr"].get("tier")
+        chips = []
+        if lvl:
+            chips.append(f"Level {lvl}")
+        if pres.get("lb"):
+            chips.append(f"Leaderboard #{pres['lb']}")
+        for c in chips:
+            rx -= app.pill(rx, y0 + 141, c, fill=CARD_HI, fg=SOFT, size=8, anchor="e") + 6
+        if tier and tier >= 3:
+            app.rank_icon(tier, rx - 16, y0 + 141, 26)
+        # tabs
+        ty = y0 + 204
+        nm = len((d.get("matches") or []))
+        opts = [("profile", "Overview"), ("matches", f"Matches  {nm}" if nm else "Matches")] + \
+            ([("chat", "Messages")] if f.get("pid") else [])
+        self.tabs(bx0, ty, opts, self.tab, self.set_tab, "tab")
+        app.cv.create_line(x0 + 20, ty + 18, x1 - 20, ty + 18, fill=LINE)
+        if self.tab != "chat":
+            lab = "Refreshing…" if self.loading else "Refresh"
+            when = ago(d.get("t"), "Updated") if d.get("t") and not self.loading else ""
+            w_ = self.button(bx1, ty - 15, lab, lambda: self.load(force=True), "refresh",
+                             "refresh", primary=False, anchor="e", h=30, disabled=self.loading)
+            if when:
+                app.text(bx1 - w_ - 12, ty, when, 8, fill=DIM, anchor="e")
+
+    def loading_blocks(self, x0, x1, y, rows=False):
+        app = self.app
+        bw = x1 - x0
+        if not rows:
+            cw = (bw - 24) / 3
+            for i in range(3):
+                cx = x0 + i * (cw + 12)
+                app.rrect(cx, y, cx + cw, y + 96, 16, fill=mix(SURFACE, CARD, 0.35), depth=0)
+                app.skel(cx + 16, y + 16, cx + 80, y + 26, 5, i)
+                app.skel(cx + 16, y + 42, cx + 60, y + 82, 10, i)
+                app.skel(cx + 72, y + 50, cx + cw - 30, y + 64, 6, i)
+            y += 112
+        for i in range(3 if not rows else 5):
+            app.rrect(x0, y, x1, y + 60, 14, fill=mix(SURFACE, CARD, 0.3), depth=0)
+            app.skel(x0 + 16, y + 8, x0 + 106, y + 52, 8, i)
+            app.skel(x0 + 120, y + 18, x0 + 300, y + 30, 6, i)
+            app.skel(x1 - 160, y + 22, x1 - 20, y + 36, 6, i)
+            y += 68
+
+    def draw_profile(self, x0, top, x1, bot):
+        app = self.app
+        d = self.data
+        y = top + 14 - self.scroll
+        bw = x1 - x0
+        V = lambda a, b: self.vis(a, b, top, bot)       # noqa: E731
+        if d is None:
+            self.loading_blocks(x0, x1, y)
+            self.max_scroll = 0
+            return
+        if d.get("fatal"):
+            self.empty(x0, x1, top + 10, "warning", "Couldn't load this profile", d["fatal"],
+                       ("Try again", lambda: self.load(force=True), "retry"))
+            self.max_scroll = 0
+            return
+        mmr = d.get("mmr")
+        err = d.get("errors") or {}
+        cw = (bw - 24) / 3
+        if mmr:
+            if V(y, y + 96):
+                tier, rr = mmr.get("tier") or 0, mmr.get("rr") or 0
+                cards = [("Current rank", tier,
+                          f"{rr} RR" if tier >= 3 else "Not ranked this act"),
+                         ("Peak rank", mmr.get("peak_tier") or 0,
+                          f"Reached in {mmr['peak_act']}" if mmr.get("peak_act")
+                          else "Highest tier with a win")]
+                for i, (lab, t, sub) in enumerate(cards):
+                    cx = x0 + i * (cw + 12)
+                    app.rrect(cx, y, cx + cw, y + 96, 16, fill=mix(SURFACE, CARD, 0.35),
+                              outline=LINE)
+                    app.text(cx + 16, y + 20, lab, 8, "bold", DIM)
+                    if not app.rank_icon(t, cx + 42, y + 60, 46, large=True):
+                        app.circle(cx + 42, y + 60, 18, fill=CARD, depth=0)
+                    col = ASSETS.tier_color(t) or MUTED
+                    app.text(cx + 76, y + 53, ASSETS.tier_name(t), 13, "bold",
+                             mix(col, "#ffffff", 0.4) if t >= 3 else MUTED, maxw=cw - 90)
+                    app.text(cx + 76, y + 74, sub, 9, fill=MUTED, maxw=cw - 90)
+                cx = x0 + 2 * (cw + 12)
+                app.rrect(cx, y, cx + cw, y + 96, 16, fill=mix(SURFACE, CARD, 0.35),
+                          outline=LINE)
+                app.text(cx + 16, y + 20, ASSETS.current_act_label or "This act", 8, "bold",
+                         DIM, maxw=cw - 30)
+                g, wins = mmr.get("games"), mmr.get("wins")
+                if g:
+                    losses = max(0, g - (wins or 0))
+                    app.text(cx + 16, y + 53, f"{wins or 0}W  {losses}L", 15, "bold")
+                    app.text(cx + 16, y + 76, f"{round(100 * (wins or 0) / g)}% win rate  ·  "
+                                              f"{g} games", 9, fill=MUTED)
+                else:
+                    app.text(cx + 16, y + 53, "No ranked games", 12, "bold", MUTED)
+                    app.text(cx + 16, y + 76, "this act yet", 9, fill=DIM)
+            y += 112
+            acts = [a for a in (mmr.get("acts") or []) if a["id"] != ASSETS.current_act][-6:]
+            if acts:
+                if V(y, y + 80):
+                    app.text(x0 + 2, y + 6, "Previous acts", 9, "bold", DIM)
+                    aw = min(150, (bw - 10 * (len(acts) - 1)) / len(acts))
+                    for i, a in enumerate(reversed(acts)):
+                        ax = x0 + i * (aw + 10)
+                        ay = y + 22
+                        app.rrect(ax, ay, ax + aw, ay + 58, 12, fill=mix(SURFACE, CARD, 0.3),
+                                  outline=LINE)
+                        app.rank_icon(a["tier"], ax + 24, ay + 29, 30)
+                        app.text(ax + 46, ay + 20, ASSETS.act_label.get(a["id"], "") or "Act",
+                                 8, "bold", DIM, maxw=aw - 52)
+                        col = ASSETS.tier_color(a["tier"]) or MUTED
+                        app.text(ax + 46, ay + 38, ASSETS.tier_name(a["tier"]), 9, "bold",
+                                 mix(col, "#ffffff", 0.4), maxw=aw - 52)
+                y += 96
+        else:
+            reason = err.get("rank") or "Riot didn't return a rank for this player."
+            hint = ("RiotHub can only read stats for players on your own region "
+                    "(EU, NA, AP, KR...)." if err.get("rank_code") in (400, 403, 404) else "")
+            if V(y, y + 78):
+                self.unavailable(x0, x1, y, "Rank isn't available", reason, hint)
+            y += 92
+        ups = [u for u in d.get("updates") or [] if u.get("tier", 0) >= 3]
+        if len(ups) >= 2:
+            gh = 110
+            if V(y, y + gh + 46):
+                app.rrect(x0, y, x1, y + gh + 46, 16, fill=mix(SURFACE, CARD, 0.3),
+                          outline=LINE)
+                app.text(x0 + 16, y + 20, f"RR over the last {len(ups)} ranked games", 8,
+                         "bold", DIM)
+                last = ups[-1]
+                app.text(x1 - 16, y + 20, f"{ASSETS.tier_name(last['tier'])}  ·  "
+                                          f"{last['rr']} RR", 9, "bold", SOFT, anchor="e")
+                vals = [u["tier"] * 100 + u["rr"] for u in ups]
+                lo, hi = min(vals), max(vals)
+                if hi - lo < 60:
+                    hi, lo = hi + 30, lo - 30
+                gx, gy, gw = int(x0 + 20), int(y + 36), int(bw - 40)
+                coords = []
+                for i, v in enumerate(vals):
+                    coords += [gx + gw * i / (len(vals) - 1), gy + gh - (v - lo) / (hi - lo) * gh]
+                app.graph_image(coords, gx, gy, gw, gh)
+                for i, u in enumerate(ups):
+                    col = GOOD if u["delta"] > 0 else (DANGER if u["delta"] < 0 else MUTED)
+                    app.circle(coords[2 * i], coords[2 * i + 1], 3.5, fill=col, depth=0)
+            y += gh + 62
+        elif err.get("history") and mmr:
+            if V(y, y + 78):
+                self.unavailable(x0, x1, y, "RR history isn't available", err["history"])
+            y += 92
+        ms = d.get("matches") or []
+        if ms and V(y, y + 60):
+            w_ = sum(1 for m in ms if m.get("won") is True)
+            l_ = sum(1 for m in ms if m.get("won") is False)
+            k_ = sum(m["k"] for m in ms)
+            dd = max(1, sum(m["d"] for m in ms))
+            app.rrect(x0, y, x1, y + 60, 14, fill=mix(SURFACE, CARD, 0.3), outline=LINE)
+            app.text(x0 + 16, y + 20, f"Last {len(ms)} competitive matches", 8, "bold", DIM)
+            bx = x0 + 16
+            for lab, val, col in (("Record", f"{w_}W {l_}L", TEXT),
+                                  ("K/D", f"{k_ / dd:.2f}", TEXT),
+                                  ("Avg ACS", str(round(sum(m['acs'] for m in ms) / len(ms))),
+                                   TEXT)):
+                app.text(bx, y + 42, val, 12, "bold", col)
+                app.text(bx + app.measure(val, 12, "bold") + 6, y + 43, lab, 8, fill=DIM)
+                bx += 150
+            key = self.k("seeall")
+            self.row_box(key, x1 - 150, y + 14, x1 - 10, y + 46, top, bot,
+                         lambda: self.set_tab("matches"))
+            app.text(x1 - 16, y + 30, "See matches  ›", 9, "bold", app.hcol(key, SOFT, TEXT),
+                     anchor="e")
+        y += 76
+        self.max_scroll = max(0.0, (y + self.scroll) - bot + 4)
+        self.scroll_t = min(self.scroll_t, self.max_scroll)
+
+    def draw_matches(self, x0, top, x1, bot):
+        app = self.app
+        d = self.data
+        y = top + 14 - self.scroll
+        if d is None:
+            self.loading_blocks(x0, x1, y, rows=True)
+            self.max_scroll = 0
+            return
+        if d.get("fatal"):
+            self.empty(x0, x1, top + 10, "warning", "Couldn't load this profile", d["fatal"],
+                       ("Try again", lambda: self.load(force=True), "retry"))
+            self.max_scroll = 0
+            return
+        err = d.get("errors") or {}
+        ms = d.get("matches") or []
+        if not ms:
+            if err.get("matches"):
+                self.unavailable(x0, x1, y, "Couldn't load their matches", err["matches"])
+            elif err.get("history"):
+                hint = ("RiotHub can only read stats for players on your own region."
+                        if "404" in err["history"] else "")
+                self.unavailable(x0, x1, y, "Match history isn't available", err["history"],
+                                 hint)
+            else:
+                self.unavailable(x0, x1, y, "No recent competitive games",
+                                 "Riot only lists their latest ranked matches - unrated, "
+                                 "Swiftplay and other modes don't show up here.")
+            self.max_scroll = 0
+            return
+        for i, mt in enumerate(ms):
+            if self.vis(y, y + 60, top, bot):
+                self.match_row(x0, x1, y, i, mt, top, bot)
+            y += 68
+        if d.get("failed_matches") and self.vis(y, y + 20, top, bot):
+            app.text(x0 + 2, y + 6, f"{d['failed_matches']} more match(es) couldn't be loaded "
+                     "right now - try Refresh in a minute.", 8, fill=DIM)
+        y += 24
+        self.max_scroll = max(0.0, (y + self.scroll) - bot + 4)
+        self.scroll_t = min(self.scroll_t, self.max_scroll)
+
+    def match_row(self, x0, x1, y, i, mt, top, bot):
+        app = self.app
+        key = self.k(f"m:{i}")
+        f = app.hv(key)
+        if y > bot or y + 60 < top:
+            return
+        self.row_box(key, x0, y, x1, y + 60, top, bot, lambda mt=mt: self.open_match(mt),
+                     tip="See the full scoreboard")
+        won = mt.get("won")
+        col = GOOD if won is True else (DANGER if won is False else MUTED)
+        app.rrect(x0, y, x1, y + 60, 14, fill=mix(mix(SURFACE, CARD, 0.3), CARD_HI, 0.55 * f),
+                  outline=mix(LINE, mix(LINE, col, 0.5), f))
+        app.rrect(x0 + 1, y + 12, x0 + 4, y + 48, 1.5, fill=col, depth=0)
+        mp = ASSETS.maps.get(mt.get("map") or "", {})
+        if not app.image(mp.get("icon") or mp.get("splash"), x0 + 14, y + 8, 88, 44,
+                         mode="cover", radius=8):
+            app.rrect(x0 + 14, y + 8, x0 + 102, y + 52, 8, fill=CARD, depth=0)
+        ag = ASSETS.agents.get(mt.get("agent") or "", {})
+        if not app.image(ag.get("icon"), x0 + 112, y + 12, 36, 36, radius=9):
+            app.rrect(x0 + 112, y + 12, x0 + 148, y + 48, 9, fill=CARD, depth=0)
+        res = "Victory" if won is True else ("Defeat" if won is False else "Draw")
+        app.text(x0 + 162, y + 22, res, 11, "bold", col)
+        if mt.get("score"):
+            app.text(x0 + 162 + app.measure(res, 11, "bold") + 10, y + 22,
+                     mt["score"].replace("-", "–"), 11, "bold")
+        app.text(x0 + 162, y + 41, "  ·  ".join(b for b in (mp.get("name"), ag.get("name"),
+                                                             ago(mt.get("start"), "").strip())
+                                               if b), 9, fill=MUTED, maxw=240)
+        cx = x1 - 330
+        _stat_label(app, cx, y + 16, "K / D / A", f"{mt['k']} / {mt['d']} / {mt['a']}", size=11)
+        _stat_label(app, cx + 104, y + 16, "ACS", str(mt["acs"]), size=11)
+        rr = mt.get("rr")
+        if rr is not None:
+            rc = GOOD if rr > 0 else (DANGER if rr < 0 else MUTED)
+            _stat_label(app, cx + 166, y + 16, "RR", f"{rr:+d}", rc, size=11)
+        if mt.get("tier_after"):
+            app.rank_icon(mt["tier_after"], x1 - 64, y + 30, 26)
+        app.icon(x1 - 22, y + 30, "chevron", 9, app.hcol(key, DIM, SOFT))
+
+    def unavailable(self, x0, x1, y, title, reason, hint=""):
+        app = self.app
+        app.rrect(x0, y, x1, y + 78, 14, fill=mix(SURFACE, BG, 0.25), outline=LINE)
+        app.circle(x0 + 34, y + 39, 16, fill=mix(SURFACE, GOLD, 0.14), depth=0)
+        app.icon(x0 + 34, y + 39, "info", 10, GOLD)
+        app.text(x0 + 62, y + 24, title, 10, "bold")
+        app.text(x0 + 62, y + 44, reason, 9, fill=MUTED, maxw=x1 - x0 - 80)
+        if hint:
+            app.text(x0 + 62, y + 61, hint, 8, fill=DIM, maxw=x1 - x0 - 80)
+
+    def empty(self, x0, x1, y, icon, title, sub, action=None):
+        app = self.app
+        cx = (x0 + x1) / 2
+        app.soft(cx - 26, y + 34, cx + 26, y + 86, 26, GOLD, alpha=60, spread=12, dy=0)
+        app.circle(cx, y + 60, 26, fill=mix(SURFACE, GOLD, 0.16), depth=1.0)
+        app.icon(cx, y + 60, icon, 13, GOLD)
+        app.text(cx, y + 112, title, 13, "bold", anchor="center")
+        for i, ln in enumerate(app.wrap(sub, 10, min(520, x1 - x0 - 60), max_lines=3)):
+            app.text(cx, y + 136 + 18 * i, ln, 10, fill=MUTED, anchor="center")
+        if action:
+            lab, fn, name = action
+            self.button(cx, y + 200, lab, fn, name, "refresh", anchor="center")
+
+    def open_match(self, mt):
+        app = self.app
+        f = MATCH_DIR / f"{mt.get('id')}.json"
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            det = match_detail(d, self.puuid, {self.puuid: self.f.get("name")})
+        except Exception as e:
+            app.toast(f"Couldn't open that match: {describe_err(e)}", "bad", tray=False)
+            return
+        if app.streamer():
+            for t in det["teams"]:
+                for r in t["rows"]:
+                    r["name"] = (ASSETS.agents.get(r["agent"]) or {}).get("name") or "Player"
+        MatchLayer(app, det, who=self.f.get("name"))
+
+    def draw_chat(self, x0, top, x1, bot, name):
+        app = self.app
+        ch = self.chat
+        log_bot = bot - 58
+        app.rrect(x0, top, x1, log_bot, 16, fill=mix(SURFACE, BG, 0.3), outline=LINE, depth=0)
+        msgs = list(ch.get("msgs") or [])
+        if ch.get("pending"):
+            msgs.append({"body": ch["pending"], "puuid": ch.get("me"), "_pending": True})
+        maxw = int((x1 - x0) * 0.62)
+        if ch.get("msgs") is None and not ch.get("err"):
+            for i in range(4):
+                yy = log_bot - 20 - 46 * (i + 1)
+                mine = i % 2 == 0
+                wv = 120 + 60 * (i % 3)
+                bx = x1 - 20 - wv if mine else x0 + 20
+                app.skel(bx, yy, bx + wv, yy + 34, 14, i)
+        elif ch.get("err") and not ch.get("msgs"):
+            cx = (x0 + x1) / 2
+            cy = (top + log_bot) / 2
+            app.circle(cx, cy - 30, 22, fill=mix(SURFACE, GOLD, 0.15), depth=0)
+            app.icon(cx, cy - 30, "chat", 11, GOLD)
+            app.text(cx, cy + 8, "Chat isn't reachable right now", 11, "bold", anchor="center")
+            for i, ln in enumerate(app.wrap(ch["err"], 9, x1 - x0 - 80, max_lines=2)):
+                app.text(cx, cy + 30 + 16 * i, ln, 9, fill=MUTED, anchor="center")
+        elif not msgs:
+            cx, cy = (x0 + x1) / 2, (top + log_bot) / 2
+            app.text(cx, cy - 6, f"No messages with {name} yet", 11, "bold", anchor="center")
+            app.text(cx, cy + 16, "Say hi - it goes through your Riot Client's chat.", 9,
+                     fill=MUTED, anchor="center")
+        else:
+            # bubbles, newest at the bottom; the wheel scrolls back
+            y = log_bot - 14 + self.chat_scroll
+            total = 0
+            me = ch.get("me")
+            prev_mine = None
+            for m in reversed(msgs):
+                mine = m.get("puuid") == me
+                lines = app.wrap(m.get("body") or "", 10, maxw - 28)
+                bh = 16 + 18 * len(lines)
+                bw = min(maxw, max(app.measure(ln, 10) for ln in lines) + 28)
+                gap = 4 if prev_mine == mine else 10
+                y -= bh
+                bx = x1 - 16 - bw if mine else x0 + 16
+                if top + 4 < y + bh and y < log_bot:
+                    fill = (mix(ACCENT, SURFACE, 0.35) if m.get("_pending") else ACCENT) \
+                        if mine else CARD_HI
+                    app.rrect(bx, y, bx + bw, y + bh, 14, fill=fill, depth=0)
+                    for i, ln in enumerate(lines):
+                        app.text(bx + 14, y + 17 + 18 * i, ln, 10, fill=TEXT)
+                y -= gap
+                total += bh + gap
+                prev_mine = mine
+            span = log_bot - top - 28
+            self.chat_scroll = min(self.chat_scroll, max(0.0, total - span))
+            # fade-out edge at the top of the log so cut-off bubbles don't look broken
+            app.rrect(x0 + 1, top + 1, x1 - 1, top + 14, 15, fill=mix(SURFACE, BG, 0.3), depth=0)
+        app.cv.create_rectangle(x0, log_bot + 1, x1, bot + 4, fill=SURFACE, outline="")
+        iy = log_bot + 12
+        self.entry("msg", self.var, x0, iy, x1 - x0 - 104, 40, on_return=self.send,
+                   hint=f"Message {name}…")
+        self.button(x1, iy + 2, "Sending…" if ch.get("sending") else "Send", self.send, "send",
+                    "chat", anchor="e", h=36, disabled=ch.get("sending") or not self.var.get().strip())
+        self.max_scroll = 0
+
+
+class MatchLayer(Layer, ScrollBody):
+    """One match: result header, the round-by-round strip and both scoreboards."""
+    W, H = 900, 720
+    COLS = [("ACS", 54), ("K / D / A", 90), ("+/-", 46), ("HS%", 52), ("ADR", 52),
+            ("DD", 52), ("FB", 38)]
+
+    def __init__(self, app, det, who=None):
+        self.det, self.who = det, who
+        super().__init__(app)
+
+    def draw(self, x0, y0, x1, y1):
+        app = self.app
+        det = self.det
+        top, bot = y0 + 150, y1 - 46
+        self.glide_scroll()
+        self.draw_body(x0 + 26, top, x1 - 26, bot)
+        self.mask(x0, y0, x1, y1, top, bot)
+        app.text(x0 + 26, y1 - 24, "Names show for the highlighted player, their party and "
+                 "your saved accounts; everyone else is shown by agent.", 8, fill=DIM,
+                 maxw=x1 - x0 - 52)
+        mp = ASSETS.maps.get(det["map"], {})
+        ban = (x0 + 8, y0 + 8, x1 - 8, y0 + 132)
+        if not app.image(mp.get("splash") or mp.get("icon"), ban[0], ban[1], ban[2] - ban[0],
+                         ban[3] - ban[1], mode="cover", radius=14, fade=True):
+            app.rrect(*ban, 14, fill=mix(SURFACE, ACCENT, 0.15), depth=0)
+        won = det["won"]
+        col = GOOD if won is True else (DANGER if won is False else MUTED)
+        res = "Victory" if won is True else ("Defeat" if won is False else "Draw")
+        a, b = det["score"]
+        app.text(x0 + 34, y0 + 48, res, 22, "bold", col)
+        if a is not None:
+            app.text(x0 + 46 + app.measure(res, 22, "bold"), y0 + 48, f"{a} – {b}", 22, "bold")
+        mins = int(det["length"] // 60)
+        meta = "  ·  ".join(x for x in (mp.get("name"), det["queue"], ago(det["start"], "").strip(),
+                                        f"{mins} min" if mins else "") if x)
+        app.text(x0 + 34, y0 + 82, meta, 10, "bold", SOFT)
+        if self.who:
+            app.text(x0 + 34, y0 + 106, f"Highlighted: {self.who.split('#')[0]}", 9,
+                     fill=MUTED)
+        self.close_btn(x1 - 34, y0 + 34)
+
+    def draw_body(self, x0, top, x1, bot):
+        app = self.app
+        det = self.det
+        y = top + 10 - self.scroll
+        rounds = det.get("rounds") or []
+        V = lambda a, b: self.vis(a, b, top, bot)       # noqa: E731
+        if rounds and not V(y, y + 60):
+            y += 68
+            rounds = []
+            skip_rounds = True
+        else:
+            skip_rounds = False
+        if rounds:
+            app.text(x0, y + 6, "Rounds", 9, "bold", DIM)
+            app.text(x1, y + 6, "E eliminated · B spike detonated · D defused · T time ran out",
+                     8, fill=DIM, anchor="e")
+            y += 22
+            cw = min(26, (x1 - x0 - 12) / max(1, len(rounds)) - 3)
+            rx = x0
+            for i, r in enumerate(rounds):
+                if i == 12:
+                    rx += 10
+                c = GOOD if r["won"] else DANGER
+                key = self.k(f"r:{i}")
+                tip = (f"Round {r['n']}: {'won' if r['won'] else 'lost'} · {r['long']}"
+                       + (f" · spike planted on {r['site']}" if r['site'] else ""))
+                tags = self.row_box(key, rx, y, rx + cw, y + 30, top, bot, None, tip=tip)
+                app.rrect(rx, y, rx + cw, y + 30, 7,
+                          fill=mix(SURFACE, c, 0.32 + 0.25 * app.hv(key)), depth=0, tags=tags)
+                app.text(rx + cw / 2, y + 15, r["short"], 8, "bold", TEXT, anchor="center",
+                         tags=tags)
+                rx += cw + 3
+            y += 46
+        elif not skip_rounds and det.get("rounds"):
+            y += 68
+        for tab in det["teams"]:
+            tcol = GOOD if tab["won"] is True else (DANGER if tab["won"] is False else MUTED)
+            cx = x1 - sum(w for _, w in self.COLS)
+            if V(y, y + 44):
+                app.text(x0, y + 8, tab["label"], 11, "bold", tcol)
+                if tab["rounds"] is not None:
+                    app.text(x0 + app.measure(tab["label"], 11, "bold") + 10, y + 9,
+                             f"{tab['rounds']} rounds", 9, fill=DIM)
+                hx = cx
+                for lab, w in self.COLS:
+                    app.text(hx + w / 2, y + 32, lab, 8, "bold", DIM, anchor="center")
+                    hx += w
+            y += 44
+            for ri, r in enumerate(tab["rows"]):
+                rh = 36
+                if V(y, y + rh - 3):
+                    bg = mix(SURFACE, ACCENT, 0.2) if r["me"] else (
+                        mix(SURFACE, CARD, 0.55) if ri % 2 == 0 else mix(SURFACE, CARD, 0.25))
+                    app.rrect(x0, y, x1, y + rh - 3, 9, fill=bg, depth=0,
+                              outline=ACCENT if r["me"] else "")
+                    ag = ASSETS.agents.get(r["agent"], {})
+                    app.image(ag.get("icon"), x0 + 8, y + 5, 26, 26, radius=7)
+                    if r["tier"] >= 3 and not (app.settings.get("focus_mode") and not r["me"]):
+                        app.rank_icon(r["tier"], x0 + 52, y + 17, 22)
+                    app.text(x0 + 70, y + 17, r["name"], 10, "bold" if r["me"] or r["party"]
+                             else "normal", TEXT if r["named"] else MUTED, maxw=cx - x0 - 80)
+                    diff = r["k"] - r["d"]
+                    vals = [(str(r["acs"]), TEXT), (f"{r['k']} / {r['d']} / {r['a']}", TEXT),
+                            (f"{diff:+d}", GOOD if diff > 0 else (DANGER if diff < 0 else MUTED)),
+                            (f"{r['hs']:.0f}%" if r["hs"] is not None else "—", SOFT),
+                            (str(r["adr"]) if r["adr"] is not None else "—", SOFT),
+                            (f"{r['dd']:+d}" if r.get("dd") is not None else "—",
+                             GOOD if (r.get("dd") or 0) > 0 else (
+                                 DANGER if (r.get("dd") or 0) < 0 else SOFT)),
+                            (str(r["fb"]), SOFT)]
+                    hx = cx
+                    for (txt, fg), (_, w) in zip(vals, self.COLS):
+                        app.text(hx + w / 2, y + 17, txt, 9, "bold", fg, anchor="center")
+                        hx += w
+                y += rh
+            y += 16
+        self.max_scroll = max(0.0, (y + self.scroll) - bot + 8)
+        self.scroll_t = min(self.scroll_t, self.max_scroll)
+
+
+def set_app_volume(frac):
+    """Set this app's own volume (its slider in the Windows volume mixer), 0..1.
+    Returns False if Windows refused, so callers can fall back."""
+    if sys.platform != "win32":
+        return False
+    try:
+        v = max(0, min(0xFFFF, int(frac * 0xFFFF)))
+        return ctypes.windll.winmm.waveOutSetVolume(None, ctypes.c_uint32(v | (v << 16))) == 0
+    except Exception:
+        return False
+
+
+def extract_audio_wav(src, dst, gain=1.0):
+    """Decode a preview video's soundtrack to a 44.1 kHz stereo WAV with PyAV.
+    Returns False when the video has no audio track."""
+    import av
+    import wave
+    from array import array
+    tmp = dst.with_suffix(f".{threading.get_ident()}.part")
+    n = 0
+    with av.open(str(src)) as box:
+        if not box.streams.audio:
+            return False
+        st = box.streams.audio[0]
+        rs = av.AudioResampler(format="s16", layout="stereo", rate=44100)
+        with wave.open(str(tmp), "wb") as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(44100)
+
+            def write(frames):
+                nonlocal n
+                if frames is None:
+                    return
+                for fr in (frames if isinstance(frames, list) else [frames]):
+                    data = bytes(fr.planes[0])[: fr.samples * 4]
+                    if gain != 1.0:
+                        a = array("h", data)
+                        a = array("h", (max(-32768, min(32767, int(x * gain))) for x in a))
+                        data = a.tobytes()
+                    w.writeframes(data)
+                    n += fr.samples
+            for fr in box.decode(st):
+                write(rs.resample(fr))
+            try:
+                write(rs.resample(None))       # flush
+            except Exception:
+                pass
+    if not n:
+        tmp.unlink(missing_ok=True)
+        return False
+    tmp.replace(dst)
+    return True
+
+
+class PreviewAudio:
+    """The soundtrack of a skin preview, restarted with every loop of the video so the two
+    stay in step. Only one preview can make sound at a time, app-wide; volume and mute are
+    remembered (Settings: preview_volume / preview_muted)."""
+    current = None
+
+    def __init__(self, app):
+        self.app = app
+        self.wav = None
+        self.status = "idle"          # idle | loading | ready | none | error | unsupported
+        self.err = ""
+        self.stopped = False
+        self._fallback_gain = None
+
+    @staticmethod
+    def supported():
+        if sys.platform != "win32":
+            return False
+        try:
+            import winsound  # noqa
+        except ImportError:
+            return False
+        return VideoPlayer.backend() == "av"
+
+    def level(self):
+        st = self.app.settings
+        if st.get("preview_muted"):
+            return 0.0
+        v = max(0, min(100, int(st.get("preview_volume", 60)))) / 100
+        return v * v                   # perceptual curve: the slider feels even
+
+    def prepare(self, src):
+        """Background thread: make the WAV next to the cached video."""
+        if not self.supported():
+            self.status = "unsupported"
+            return
+        self.status = "loading"
+        dst = VIDEO_DIR / (Path(str(src)).stem + ".wav")
+        try:
+            if not (dst.exists() and dst.stat().st_size > 44):
+                if not extract_audio_wav(src, dst):
+                    self.status = "none"
+                    return
+            self.wav = dst
+            self.status = "ready"
+        except Exception as e:
+            self.status, self.err = "error", describe_err(e)
+
+    def start(self):
+        """UI thread, on the first frame of every loop."""
+        if self.stopped or not self.wav:
+            return
+        try:
+            import winsound
+        except ImportError:
+            return
+        if PreviewAudio.current not in (None, self):
+            PreviewAudio.current.stop()
+        PreviewAudio.current = self
+        wav = self.wav
+        try:
+            if set_app_volume(self.level()):
+                # muted = volume 0 but still playing, so unmuting is instant and in sync
+                winsound.PlaySound(str(wav), winsound.SND_FILENAME | winsound.SND_ASYNC
+                                   | winsound.SND_NODEFAULT)
+            elif self.level() <= 0:
+                winsound.PlaySound(None, 0)
+            else:
+                # Windows wouldn't set our volume: play a copy with the volume baked in
+                winsound.PlaySound(str(self._scaled()), winsound.SND_FILENAME
+                                   | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+        except Exception as e:
+            self.status, self.err = "error", describe_err(e)
+
+    def _scaled(self):
+        g = round(self.level(), 1)
+        p = self.wav.with_name(self.wav.stem + f".g{int(g * 10)}.wav")
+        if not p.exists():
+            try:
+                import wave
+                from array import array
+                with wave.open(str(self.wav)) as r:
+                    params, data = r.getparams(), r.readframes(r.getnframes())
+                a = array("h", data)
+                a = array("h", (int(x * g) for x in a))
+                with wave.open(str(p), "wb") as w:
+                    w.setparams(params)
+                    w.writeframes(a.tobytes())
+            except Exception:
+                return self.wav
+        return p
+
+    def apply(self):
+        """Volume or mute changed while playing."""
+        if PreviewAudio.current is self and not self.stopped:
+            if not set_app_volume(self.level()):
+                self.start()           # fallback path re-renders at the new level
+
+    def stop(self):
+        self.stopped = True
+        if PreviewAudio.current is self:
+            PreviewAudio.current = None
+            try:
+                import winsound
+                winsound.PlaySound(None, 0)
+            except Exception:
+                pass
+            set_app_volume(1.0)
+
+
 class VideoPlayer:
     """Plays a skin preview video inside a Label. Decodes with PyAV (pip install av) or
     OpenCV in a background thread; frames are scaled there so the UI thread only pastes."""
 
-    def __init__(self, app, label, url, w, h, on_text=None):
+    def __init__(self, app, label, url, w, h, on_text=None, audio=None):
         self.app, self.label, self.url, self.w, self.h = app, label, url, w, h
+        self.audio = audio
         self.on_text = on_text or (lambda t: None)
         self.q = queue.Queue(maxsize=24)
         self.stop_flag = False
@@ -4343,6 +5594,8 @@ class VideoPlayer:
 
     def stop(self):
         self.stop_flag = True
+        if self.audio:
+            self.audio.stop()
 
     _fetching = set()
 
@@ -4409,13 +5662,27 @@ class VideoPlayer:
     def _work(self):
         try:
             cached = self.cache_path(self.url)
-            if cached.exists() and cached.stat().st_size > 1000:
+            be = self.backend()
+            if self.audio and be == "av" and self.audio.supported():
+                # sound needs the whole file: finish the download, pull out the track, then
+                # start picture and sound together
+                waited = 0.0
+                while self.url in VideoPlayer._fetching and not self.stop_flag and waited < 90:
+                    if not waited:
+                        self._say("Loading video…")
+                    time.sleep(0.2)                 # the prefetch is already on it
+                    waited += 0.2
+                src = self._download()
+                if not src or self.stop_flag:
+                    return
+                self._say("Loading sound…")
+                self.audio.prepare(src)
+            elif cached.exists() and cached.stat().st_size > 1000:
                 src = cached
             else:
                 # start playing straight from the web while the file caches for next time
                 src = self.url
                 self.prefetch(self.url)
-            be = self.backend()
             while not self.stop_flag:
                 n = 0
                 if src == self.url and cached.exists() and cached.stat().st_size > 1000:
@@ -4425,7 +5692,12 @@ class VideoPlayer:
                         self._say("")
                     if self.stop_flag:
                         return
-                    self.q.put(im)
+                    while not self.stop_flag:          # bounded wait so stop() is prompt
+                        try:
+                            self.q.put((im, n == 0), timeout=0.25)
+                            break
+                        except queue.Full:
+                            continue
                     n += 1
                 if not n:
                     raise RuntimeError("no frames")
@@ -4480,9 +5752,11 @@ class VideoPlayer:
         now = time.time()
         if now - self.last >= 1 / max(1.0, self.fps) - 0.004:
             try:
-                im = self.q.get_nowait()
+                im, first = self.q.get_nowait()
             except queue.Empty:
-                im = None
+                im, first = None, False
+            if first and self.audio:
+                self.audio.start()          # every loop restarts the sound with the picture
             if im is not None:
                 self.last = now
                 if self.photo is None or (self.photo.width(), self.photo.height()) != im.size:
@@ -4494,7 +5768,7 @@ class VideoPlayer:
         self.app.after(8, self._tick)
 
 
-class Modal(Sheet):
+class SheetModal(Sheet):
     def __init__(self, app, title, message, entry=None, ok="OK", cancel="Cancel",
                  danger=False, password=False, confirm_password=False):
         super().__init__(app)
@@ -4540,6 +5814,103 @@ class Modal(Sheet):
             return
         self.result = self.var.get() if self.var is not None else True
         self.destroy()
+
+
+class ConfirmLayer(Layer):
+    """Confirmations, notices and one-line prompts. Same API as before:
+    Modal(app, title, message, ...).result blocks until the user answers."""
+    W = 480
+
+    def __init__(self, app, title, message, entry=None, ok="OK", cancel="Cancel",
+                 danger=False, password=False, confirm_password=False, block=True,
+                 opaque=False):
+        self.opaque = opaque
+        self.title, self.message = title, message
+        self.ok_label, self.cancel_label, self.danger = ok, cancel, danger
+        self.result = None
+        self.err = ""
+        self.var = tk.StringVar(app, value=entry or "") if (entry is not None or password) else None
+        self.var2 = tk.StringVar(app) if confirm_password else None
+        self.password = password
+        self.dismiss = bool(cancel)
+        self._done = tk.IntVar(app, value=0)
+        super().__init__(app)
+        if self.var is not None:
+            self.focus("e1")
+        if block:
+            try:
+                app.wait_variable(self._done)
+            except tk.TclError:
+                pass
+
+    def size(self, w, h):
+        lines = self.app.wrap(self.message, 10, self.W - 64)
+        hgt = 96 + 20 * len(lines) + (54 if self.var is not None else 0) + \
+            (70 if self.var2 is not None else 0) + (22 if self.err else 0) + 66
+        return min(self.W, w - 48), min(hgt, h - 48)
+
+    def draw(self, x0, y0, x1, y1):
+        app = self.app
+        px = x0 + 30
+        y = y0 + 34
+        if self.danger:
+            app.circle(x1 - 40, y0 + 40, 16, fill=mix(SURFACE, DANGER, 0.2), depth=0)
+            app.icon(x1 - 40, y0 + 40, "warning", 10, DANGER)
+        app.text(px, y, self.title, 15, "bold", maxw=x1 - x0 - 110)
+        y += 30
+        for ln in app.wrap(self.message, 10, self.W - 64):
+            app.text(px, y, ln, 10, fill=MUTED)
+            y += 20
+        y += 8
+        if self.var is not None:
+            self.entry("e1", self.var, px, y, x1 - x0 - 60, 40, show="•" if self.password else "",
+                       on_return=self.ok)
+            y += 54
+        if self.var2 is not None:
+            app.text(px, y + 6, "Repeat password", 8, "bold", DIM)
+            self.entry("e2", self.var2, px, y + 20, x1 - x0 - 60, 40, show="•",
+                       on_return=self.ok)
+            y += 70
+        if self.err:
+            app.text(px, y + 4, self.err, 9, fill=DANGER)
+        bx = x1 - 30
+        by = y1 - 30 - 38
+        bx -= self.button(bx, by, self.ok_label, self.ok, "ok", danger=self.danger,
+                          anchor="e", h=38) + 10
+        if self.cancel_label:
+            self.button(bx, by, self.cancel_label, self.close, "cancel", primary=False,
+                        anchor="e", h=38)
+
+    def on_key(self, seq, e):
+        if seq == "<Return>":
+            self.ok()
+            return True
+        return super().on_key(seq, e)
+
+    def ok(self):
+        if self.var2 is not None and self.var.get() != self.var2.get():
+            self.err = "Passwords don't match."
+            self.app.layer_redraw()
+            return
+        self.result = self.var.get() if self.var is not None else True
+        self.close()
+
+    def on_closing(self):
+        try:
+            self._done.set(1)
+        except tk.TclError:
+            pass
+
+
+def Modal(app, title, message, entry=None, ok="OK", cancel="Cancel", danger=False,
+          password=False, confirm_password=False, opaque=False):
+    """Ask or tell the user something. Drawn on the canvas, unless one of the classic
+    Tk dialogs is already open (it would cover a canvas dialog), then it stacks on that."""
+    kw = dict(entry=entry, ok=ok, cancel=cancel, danger=danger, password=password,
+              confirm_password=confirm_password)
+    if getattr(app, "sheets", None):
+        return SheetModal(app, title, message, **kw)
+    return ConfirmLayer(app, title, message, opaque=opaque, **kw)
 
 
 class AccountEditor(Sheet):
@@ -4704,120 +6075,12 @@ class AccountEditor(Sheet):
         self.destroy()
 
 
-class ChatSheet(Sheet):
-    """Message a friend without opening VALORANT (goes through the Riot Client's chat)."""
-    MAX = 14
-
-    def __init__(self, app, friend):
-        super().__init__(app)
-        self.app, self.f = app, friend
-        self.cid = friend["pid"]
-        self.me = None
-        self.sig = None
-        f = tk.Frame(self, bg=SURFACE, padx=24, pady=20)
-        f.pack(fill="both")
-        head = tk.Frame(f, bg=SURFACE)
-        head.pack(fill="x")
-        col = GOOD if friend.get("online") else DIM
-        tk.Label(head, text="●", bg=SURFACE, fg=col, font=(app.UI, 10)).pack(side="left")
-        name = "Hidden" if app.streamer() else friend["name"]
-        tk.Label(head, text=" " + name, bg=SURFACE, fg=TEXT, font=(app.UI, 14, "bold")
-                 ).pack(side="left")
-        x = tk.Label(head, text="✕", bg=SURFACE, fg=DIM, cursor="hand2",
-                     font=(app.UI, 12, "bold"))
-        x.pack(side="right")
-        x.bind("<Button-1>", lambda e: self.destroy())
-        tk.Label(f, text=friend.get("detail") or ("Online" if friend.get("online") else "Offline"),
-                 bg=SURFACE, fg=MUTED, font=(app.UI, 9), anchor="w").pack(fill="x")
-        self.log = tk.Frame(f, bg=mix(SURFACE, BG, 0.35), width=440, height=330)
-        self.log.pack(fill="both", pady=(14, 12))
-        self.log.pack_propagate(False)
-        self.inner = tk.Frame(self.log, bg=self.log["bg"], padx=12, pady=10)
-        self.inner.pack(side="bottom", fill="x")
-        row = tk.Frame(f, bg=SURFACE)
-        row.pack(fill="x")
-        self.var = tk.StringVar()
-        self.e = app.entry(row, self.var)
-        self.e.pack(side="left", fill="x", expand=True)
-        app.button(row, "Send", ACCENT, self.send).pack(side="left", padx=(8, 0))
-        self.e.bind("<Return>", lambda e: self.send())
-        self.bind("<Escape>", lambda e: self.destroy())
-        self.status = tk.Label(f, text="Loading messages…", bg=SURFACE, fg=DIM,
-                               font=(app.UI, 8), anchor="w")
-        self.status.pack(fill="x", pady=(6, 0))
-        app.center(self)
-        self.e.focus_set()
-        self.poll()
-
-    def poll(self):
-        if self._closing:
-            return
-
-        def work():
-            lf = read_lockfile()
-            try:
-                if not lf:
-                    raise ClientDown("")
-                if not self.me:
-                    self.me = local_tokens(lf)[2]
-                msgs = chat_history(lf, self.cid)
-                self.app.call_ui(lambda: self.show(msgs))
-            except Exception as e:
-                err = describe_err(e)
-                self.app.call_ui(lambda: self.status.winfo_exists() and self.status.config(
-                    text=f"Can't reach chat: {err}"))
-        threading.Thread(target=work, daemon=True).start()
-        self.after(2500, self.poll)
-
-    def show(self, msgs):
-        if self._closing:
-            return
-        msgs = msgs[-self.MAX:]
-        sig = tuple((m.get("id") or m.get("time"), m.get("body")) for m in msgs)
-        self.status.config(text="Messages go through your Riot Client's chat.")
-        if sig == self.sig:
-            return
-        self.sig = sig
-        for w in self.inner.winfo_children():
-            w.destroy()
-        if not msgs:
-            tk.Label(self.inner, text="No messages yet - say hi.", bg=self.inner["bg"], fg=DIM,
-                     font=(self.app.UI, 9)).pack(pady=20)
-        for m in msgs:
-            mine = m.get("puuid") == self.me
-            row = tk.Frame(self.inner, bg=self.inner["bg"])
-            row.pack(fill="x", pady=2)
-            tk.Label(row, text=m.get("body") or "", bg=ACCENT if mine else CARD, fg=TEXT,
-                     font=(self.app.UI, 10), wraplength=300, justify="left", padx=12, pady=7
-                     ).pack(side="right" if mine else "left")
-
-    def send(self):
-        text = self.var.get().strip()
-        if not text:
-            return
-        self.var.set("")
-
-        def work():
-            try:
-                lf = read_lockfile()
-                if not lf:
-                    raise ClientDown("")
-                chat_send(lf, self.cid, text)
-                msgs = chat_history(lf, self.cid)
-                self.app.call_ui(lambda: self.show(msgs))
-            except Exception as e:
-                err = describe_err(e)
-                self.app.call_ui(lambda: (self.var.set(text), self.status.config(
-                    text=f"Didn't send: {err}")))
-        threading.Thread(target=work, daemon=True).start()
-
-
 class WelcomeSheet(Sheet):
     """First run: three quick steps, then straight into the app."""
 
     def __init__(self, app):
         super().__init__(app)
-        self.app, self.step = app, 0
+        self.app, self.stage = app, 0
         self.f = tk.Frame(self, bg=SURFACE, padx=34, pady=28, width=520, height=430)
         self.f.pack(fill="both")
         self.f.pack_propagate(False)
@@ -4835,14 +6098,14 @@ class WelcomeSheet(Sheet):
         d = tk.Frame(row, bg=SURFACE)
         d.pack(side="left")
         for i in range(3):
-            tk.Label(d, text="●", bg=SURFACE, fg=ACCENT if i == self.step else CARD_HI,
+            tk.Label(d, text="●", bg=SURFACE, fg=ACCENT if i == self.stage else CARD_HI,
                      font=(self.app.UI, 8)).pack(side="left", padx=2)
         return row
 
     def show(self):
         app = self.app
         self.clear()
-        if self.step == 0:
+        if self.stage == 0:
             logo = app.logo_photo(84)
             if logo:
                 tk.Label(self.f, image=logo, bg=SURFACE).pack(pady=(18, 14))
@@ -4855,7 +6118,7 @@ class WelcomeSheet(Sheet):
             row = self.dots()
             app.button(row, "Get started", ACCENT, self.next).pack(side="right")
             app.button(row, "Skip", CARD, self.finish).pack(side="right", padx=(0, 8))
-        elif self.step == 1:
+        elif self.stage == 1:
             tk.Label(self.f, text="Pick a look", bg=SURFACE, fg=TEXT, font=(app.UI, 16, "bold"),
                      anchor="w").pack(fill="x", pady=(8, 2))
             tk.Label(self.f, text="You can change this or choose any colour later in Settings.",
@@ -4896,11 +6159,11 @@ class WelcomeSheet(Sheet):
             app.button(row, "Later", CARD, self.finish).pack(side="right", padx=(0, 8))
 
     def next(self):
-        self.step = min(2, self.step + 1)
+        self.stage = min(2, self.stage + 1)
         self.show()
 
     def back(self):
-        self.step = max(0, self.step - 1)
+        self.stage = max(0, self.stage - 1)
         self.show()
 
     def finish(self):
@@ -4912,7 +6175,7 @@ class WelcomeSheet(Sheet):
 class UpdateSheet(Sheet):
     def __init__(self, app, info):
         super().__init__(app)
-        self.app, self.info = app, info
+        self.app, self.upd = app, info
         f = tk.Frame(self, bg=SURFACE, padx=28, pady=24)
         f.pack(fill="both")
         tk.Label(f, text=f"Version {info['version']} is out", bg=SURFACE, fg=TEXT,
@@ -4939,13 +6202,13 @@ class UpdateSheet(Sheet):
         app.center(self)
 
     def skip(self):
-        self.app.state_["skip_version"] = self.info["version"]
+        self.app.state_["skip_version"] = self.upd["version"]
         save_state(self.app.state_)
         self.destroy()
 
     def install(self):
         self.status.config(text="Downloading…")
-        info = self.info
+        info = self.upd
 
         installed = is_installed_copy()
         url = info["setup"] if installed else info["exe"]
@@ -5071,7 +6334,7 @@ class PenaltySheet(Sheet):
 class FullscreenVideo(tk.Toplevel):
     """Black fullscreen viewer for a skin preview. Esc, click or double-click closes it."""
 
-    def __init__(self, app, url, title=""):
+    def __init__(self, app, url, title="", sound=False):
         super().__init__(app)
         self.app = app
         self.overrideredirect(True)
@@ -5087,7 +6350,8 @@ class FullscreenVideo(tk.Toplevel):
         cap.place(relx=0.5, rely=0.97, anchor="s")
         self.player = VideoPlayer(app, self.label, url, sw, int(sh * 0.94),
                                   on_text=lambda t: self.label.winfo_exists() and t and
-                                  self.label.config(text=t))
+                                  self.label.config(text=t),
+                                  audio=PreviewAudio(app) if sound else None)
         for w in (self, self.label, cap):
             w.bind("<Button-1>", lambda e: self.close())
         self.bind("<Escape>", lambda e: self.close())
@@ -5101,119 +6365,60 @@ class FullscreenVideo(tk.Toplevel):
             pass
 
 
-class SkinDialog(Sheet):
-    """Skin details: a 16:9 preview that plays videos in place (or fullscreen), chromas,
-    levels, wishlist and equip."""
-    HW, HH = 640, 360
+class CanvasSink:
+    """What VideoPlayer draws into when the video lives on the canvas: it just holds the
+    current PhotoImage (frames are pasted into it in place, so no redraw per frame)."""
+
+    def __init__(self, app):
+        self.app, self.photo, self.alive, self.image = app, None, True, None
+
+    def config(self, image=None, text=None, **kw):
+        if image not in (None, ""):
+            if image is not self.photo:
+                self.photo = image
+                self.app.layer_redraw()
+
+    configure = config
+
+    def winfo_exists(self):
+        return self.alive
+
+
+class SkinDialog(Layer):
+    """Skin details: a 16:9 stage that plays the preview videos in place - with sound,
+    a mute button and a volume slider that are remembered - plus chromas, levels, wishlist
+    and equip."""
+    W, H = 880, 720
 
     def __init__(self, app, skin_uuid, owner=None):
-        super().__init__(app)
-        self.app, self.skin, self.owner = app, ASSETS.skins[skin_uuid], owner
-        self.uuid = skin_uuid
+        self.skin = ASSETS.skins[skin_uuid]
+        self.uuid, self.owner = skin_uuid, owner
         meta = app.m(owner) if owner else {}
         self.owned_levels = owned_ids(meta, "skins")
         self.owned_chromas = owned_ids(meta, "chromas")
         self.owns = skin_uuid in owned_skin_set(meta) if owner else False
         self.chroma_i = 0
-        self.video_url = None
         eq = (meta.get("loadout") or {}).get(self.skin["weapon_id"]) or {}
         if eq.get("skin") == skin_uuid:
-            for i, c in enumerate(self.skin["chromas"]):
+            for n, c in enumerate(self.skin["chromas"]):
                 if c["uuid"] == eq.get("chroma"):
-                    self.chroma_i = i
-        self.title(self.skin["name"])
-        self.configure(bg=SURFACE)
+                    self.chroma_i = n
         ct = ASSETS.ctiers.get(self.skin.get("tier") or "", {})
+        self.edition = (ct.get("display") or ct.get("name") or "").replace("_EDITION", "") \
+            .replace("_Edition", "").title()
         self.tcol = ct.get("color") or ACCENT
-        self.stage_bg = mix(BG, self.tcol, 0.10)
-        f = tk.Frame(self, bg=SURFACE, padx=26, pady=22)
-        f.pack(fill="both")
-        head = tk.Frame(f, bg=SURFACE)
-        head.pack(fill="x")
-        tk.Label(head, text=self.skin["name"], bg=SURFACE, fg=TEXT,
-                 font=(app.UI, 17, "bold"), anchor="w").pack(side="left")
-        x = tk.Label(head, text="✕", bg=SURFACE, fg=DIM, cursor="hand2",
-                     font=(app.UI, 12, "bold"))
-        x.pack(side="right")
-        x.bind("<Button-1>", lambda e: self.destroy())
-        x.bind("<Enter>", lambda e: x.config(fg=TEXT))
-        x.bind("<Leave>", lambda e: x.config(fg=DIM))
-        meta_row = tk.Frame(f, bg=SURFACE)
-        meta_row.pack(fill="x", pady=(4, 0))
-        edition = (ct.get("name") or "").title()
-        if edition:
-            tk.Label(meta_row, text=f" {edition} ", bg=mix(SURFACE, self.tcol, 0.35), fg=TEXT,
-                     font=(app.UI, 8, "bold")).pack(side="left", padx=(0, 8))
-        price = ASSETS.skin_price(skin_uuid)
-        sub = "  ·  ".join(x_ for x_ in (self.skin["weapon"],
-                                         f"{price:,} VP" if price else None,
-                                         ASSETS.themes.get(self.skin.get("theme") or "")) if x_)
-        tk.Label(meta_row, text=sub, bg=SURFACE, fg=MUTED, font=(app.UI, 10)).pack(side="left")
-        if self.owns:
-            tk.Label(meta_row, text="✓ Owned", bg=SURFACE, fg=GOOD,
-                     font=(app.UI, 9, "bold")).pack(side="right")
-
-        # stage: fixed 16:9, image or video
         self.player = None
-        self.box = box = tk.Frame(f, bg=self.stage_bg, width=self.HW, height=self.HH)
-        box.pack(pady=(14, 0))
-        box.pack_propagate(False)
-        self.hero = tk.Label(box, bg=self.stage_bg)
-        self.hero.pack(fill="both", expand=True)
-        self.hero.bind("<Double-Button-1>", lambda e: self.fullscreen())
-        # overlay controls
-        self.big_play = tk.Label(box, text="▶", bg=mix(self.stage_bg, "#000000", 0.45),
-                                 fg="#ffffff", font=(app.UI, 18), width=3, cursor="hand2")
-        self.big_play.bind("<Button-1>", lambda e: self.play(self.video_url))
-        self.big_play.bind("<Enter>", lambda e: self.big_play.config(bg=self.tcol))
-        self.big_play.bind("<Leave>", lambda e: self.big_play.config(
-            bg=mix(self.stage_bg, "#000000", 0.45)))
-        self.ctrl = tk.Frame(box, bg="#0b0912")
-        for txt, fn, tip in (("■", self.stop_video, "Stop"), ("⛶", self.fullscreen,
-                                                              "Fullscreen")):
-            b = tk.Label(self.ctrl, text=txt, bg="#0b0912", fg="#e8e3f5", cursor="hand2",
-                         font=(app.UI, 11, "bold"), padx=10, pady=4)
-            b.pack(side="left")
-            b.bind("<Button-1>", lambda e, fn=fn: fn())
-            b.bind("<Enter>", lambda e, b=b: b.config(bg=ACCENT))
-            b.bind("<Leave>", lambda e, b=b: b.config(bg="#0b0912"))
-        self.vstatus = tk.Label(box, text="", bg=self.stage_bg, fg=MUTED, font=(app.UI, 9))
-
-        self.chroma_row = tk.Frame(f, bg=SURFACE)
-        self.chroma_row.pack(fill="x", pady=(14, 0))
-        self.levels = tk.Frame(f, bg=SURFACE)
-        self.levels.pack(fill="x", pady=(10, 0))
-        bar = tk.Frame(f, bg=SURFACE)
-        bar.pack(fill="x", pady=(18, 0))
-        self.wish_btn = app.button(bar, "", CARD_HI, self.toggle_wish)
-        self.wish_btn.pack(side="right")
-        active = owner and app.state_.get("active") == owner
-        if self.owns and active:
-            app.button(bar, "Equip", ACCENT, self.equip).pack(side="right", padx=(0, 8))
-        note = (f"Owned by {owner}. Log into it to equip." if self.owns and not active else
-                f"{owner} doesn't own this skin." if owner and not self.owns else "")
-        if note:
-            tk.Label(bar, text=note, bg=SURFACE, fg=DIM, font=(app.UI, 9)).pack(side="left")
-        self.bind("<Escape>", lambda e: self.destroy())
-        if app.images:
-            app.images.listeners.add(self.refresh)
-        # warm the cache with the most interesting video so Play is instant
-        for lv in reversed(self.skin["levels"]):
+        self.audio = None
+        self.sink = None
+        self.playing_url = None
+        self.vstatus = ""
+        super().__init__(app)
+        for lv in reversed(self.skin["levels"]):      # warm the cache so Play is instant
             if lv.get("video"):
                 VideoPlayer.prefetch(lv["video"])
                 break
-        self.refresh()
-        app.center(self)
-        self.wait_window()
-        if app.images:
-            app.images.listeners.discard(self.refresh)
 
-    def destroy(self):
-        if self.app.images:
-            self.app.images.listeners.discard(self.refresh)
-        self.stop_video(redraw=False)
-        super().destroy()
-
+    # ---- video
     def best_video(self):
         s = self.skin
         ch = s["chromas"][self.chroma_i] if s["chromas"] else {}
@@ -5230,146 +6435,296 @@ class SkinDialog(Sheet):
             return
         if not VideoPlayer.backend():
             webbrowser.open(url)
-            app.toast("Opened in your browser. To play previews in the app, run: "
-                      "py -m pip install av", tray=False)
+            app.toast("Opened in your browser. In-app previews need the video add-on "
+                      "(py -m pip install av).", tray=False)
             return
-        self.stop_video(redraw=False)
+        self.stop_video()
         self.playing_url = url
-        self.big_play.place_forget()
-        self.hero.config(image="")
-        self.hero.image = None
-        self.vstatus.config(text="Loading…")
-        self.vstatus.place(relx=0.5, rely=0.5, anchor="center")
-        self.ctrl.place(relx=1.0, rely=1.0, x=-10, y=-10, anchor="se")
+        self.sink = CanvasSink(app)
+        self.audio = PreviewAudio(app) if PreviewAudio.supported() else None
+        self.vstatus = "Loading…"
 
         def say(t):
-            try:
-                if t:
-                    self.vstatus.config(text=t)
-                    self.vstatus.place(relx=0.5, rely=0.5, anchor="center")
-                else:
-                    self.vstatus.place_forget()
-            except tk.TclError:
-                pass
-        self.player = VideoPlayer(app, self.hero, url, self.HW, self.HH, on_text=say)
+            self.vstatus = t or ""
+            app.layer_redraw()
+        sw, sh = self.stage_size()
+        self.player = VideoPlayer(app, self.sink, url, sw, sh, on_text=say, audio=self.audio)
+        app.layer_redraw()
+
+    def stop_video(self):
+        if self.player:
+            self.player.stop()            # stops its sound too
+            self.player = None
+        if self.sink:
+            self.sink.alive = False
+            self.sink = None
+        self.audio = None
+        self.playing_url = None
+        self.vstatus = ""
 
     def fullscreen(self):
-        url = getattr(self, "playing_url", None) if self.player else None
-        url = url or self.video_url
+        url = self.playing_url or self.best_video()
         if not url:
             return
         if not VideoPlayer.backend():
             return self.play(url)
         self.stop_video()
-        FullscreenVideo(self.app, url, self.skin["name"])
+        FullscreenVideo(self.app, url, self.skin["name"], sound=PreviewAudio.supported())
+        self.app.layer_redraw()
 
-    def stop_video(self, redraw=True):
-        if self.player:
-            self.player.stop()
-            self.player = None
-        try:
-            self.ctrl.place_forget()
-            self.vstatus.place_forget()
-        except tk.TclError:
-            return
-        if redraw:
-            self.refresh()
+    def on_closing(self):
+        self.stop_video()
 
-    def chip(self, parent, text, on=False, dim=False, fn=None):
-        bg = ACCENT if on else CARD
-        b = tk.Label(parent, text=text, bg=bg, fg=TEXT if not dim else DIM,
-                     font=(self.app.UI, 9, "bold"), padx=12, pady=6,
-                     cursor="hand2" if fn else "")
-        b.pack(side="left", padx=(0, 6))
-        if fn:
-            b.bind("<Button-1>", lambda e: fn())
-            b.bind("<Enter>", lambda e: b.config(bg=ACCENT if on else CARD_HI))
-            b.bind("<Leave>", lambda e: b.config(bg=bg))
-        return b
+    # ---- sound
+    def toggle_mute(self):
+        st = self.app.settings
+        st["preview_muted"] = not st.get("preview_muted")
+        if not st["preview_muted"] and int(st.get("preview_volume", 60)) <= 0:
+            st["preview_volume"] = 40
+        save_state(self.app.state_)
+        if self.audio:
+            self.audio.apply()
+        self.app.layer_redraw()
 
-    def refresh(self):
-        if not self.winfo_exists():
-            return
-        app, s = self.app, self.skin
-        ch = s["chromas"][self.chroma_i] if s["chromas"] else {}
-        url = ch.get("render") or s["icon"]
-        self.video_url = self.best_video()
-        if not self.player:
-            im = app.images.get(url, self.HW - 60, self.HH - 60) if app.images else None
-            self.hero.config(image=im or "", text="" if im else "Loading preview…",
-                             fg=MUTED, font=(app.UI, 10))
-            self.hero.image = im
-            if self.video_url:
-                self.big_play.place(relx=0.5, rely=1.0, y=-18, anchor="s")
-            else:
-                self.big_play.place_forget()
-        for wdg in self.chroma_row.winfo_children():
-            wdg.destroy()
-        for wdg in self.levels.winfo_children():
-            wdg.destroy()
-        if len(s["chromas"]) > 1:
-            tk.Label(self.chroma_row, text="Chromas", bg=SURFACE, fg=DIM, width=8, anchor="w",
-                     font=(app.UI, 8, "bold")).pack(side="left")
-            for i, c in enumerate(s["chromas"]):
-                own = (i == 0 and self.owns) or c["uuid"] in self.owned_chromas
-                sw = app.images.get(c.get("swatch"), 30, 30, radius=8) \
-                    if (app.images and c.get("swatch")) else None
-                ring = tk.Frame(self.chroma_row, bg=ACCENT if i == self.chroma_i else SURFACE,
-                                padx=2, pady=2)
-                ring.pack(side="left", padx=(0, 6))
-                b = tk.Label(ring, image=sw or "", text="" if sw else str(i + 1), bg=CARD,
-                             fg=TEXT, cursor="hand2", width=None if sw else 3)
-                b.image = sw
-                b.pack()
-                b.bind("<Button-1>", lambda e, i=i: self.pick(i))
-                tip = c["name"].split("\n")[0] + ("" if own or not self.owner else "  ·  locked")
-                b.bind("<Enter>", lambda e, t=tip: self.chroma_label.config(text=t, fg=SOFT))
-                b.bind("<Leave>", lambda e: self.chroma_label.config(
-                    text=self.chroma_name(), fg=MUTED))
-            self.chroma_label = tk.Label(self.chroma_row, text=self.chroma_name(), bg=SURFACE,
-                                         fg=MUTED, font=(app.UI, 9))
-            self.chroma_label.pack(side="left", padx=8)
-        else:
-            self.chroma_label = tk.Label(self.chroma_row)
-        if len(s["levels"]) > 1 or (s["levels"] and s["levels"][0].get("video")):
-            tk.Label(self.levels, text="Levels", bg=SURFACE, fg=DIM, width=8, anchor="w",
-                     font=(app.UI, 8, "bold")).pack(side="left")
-            for i, lv in enumerate(s["levels"]):
-                own = lv["uuid"] in self.owned_levels or (i == 0 and self.owns)
-                label = f"{i + 1}" + (f" · {lv['item']}" if lv.get("item") else "")
-                vid = lv.get("video")
-                cur = self.player is not None and getattr(self, "playing_url", None) == vid
-                self.chip(self.levels, ("▶ " if vid else "") + label, on=cur,
-                          dim=bool(self.owner) and not own,
-                          fn=(lambda v=vid: self.play(v)) if vid else None)
-        on = self.uuid in app.state_["wishlist"]
-        self.wish_btn.config(text="★  On wishlist" if on else "☆  Add to wishlist",
-                             fg=GOLD if on else TEXT)
+    def set_volume_at(self, x):
+        sx0, sx1 = getattr(self, "_vol_track", (0, 1))
+        v = int(round(max(0.0, min(1.0, (x - sx0) / max(1, sx1 - sx0))) * 100))
+        st = self.app.settings
+        st["preview_volume"] = v
+        st["preview_muted"] = v == 0
+        if self.audio:
+            self.audio.apply()
+        self.app.save_soon()
 
-    def chroma_name(self):
-        c = self.skin["chromas"][self.chroma_i] if self.skin["chromas"] else {}
-        return (c.get("name") or "").split("\n")[0]
-
+    # ---- actions
     def pick(self, i):
         self.chroma_i = i
-        self.stop_video(redraw=False)
+        self.stop_video()
         v = self.best_video()
         if v:
             VideoPlayer.prefetch(v)
-        self.refresh()
+        self.app.layer_redraw()
 
     def toggle_wish(self):
         self.app.toggle_wish(self.uuid)
-        self.refresh()
+        self.app.layer_redraw()
 
     def equip(self):
         ch = self.skin["chromas"][self.chroma_i]["uuid"] if self.skin["chromas"] else None
         if self.chroma_i and ch not in self.owned_chromas:
-            self.app.notify("Locked chroma", "You don't own that chroma yet. Equipping the "
-                                             "base one instead.")
+            self.app.toast("You don't own that chroma - equipped the base one.", tray=False)
             ch = self.skin["chromas"][0]["uuid"]
+        self.close()
         self.app.equip_skin(self.uuid, ch)
-        self.destroy()
+
+    def on_key(self, seq, e):
+        return super().on_key(seq, e)
+
+    # ---- drawing
+    def stage_size(self):
+        x0, y0, x1, y1 = self.box
+        sw = int((x1 - x0) - 56)
+        sh = int(sw * 9 / 16)
+        avail = int((y1 - y0) - 300)
+        if sh > avail:
+            sh = max(180, avail)
+            sw = int(sh * 16 / 9)
+        return sw, sh
+
+    def size(self, w, h):
+        pw = min(self.W, w - 48)
+        sh = int((pw - 56) * 9 / 16)
+        return pw, min(h - 40, sh + 318)
+
+    def draw(self, x0, y0, x1, y1):
+        app, s = self.app, self.skin
+        px = x0 + 28
+        # header
+        app.text(px, y0 + 36, s["name"], 18, "bold", maxw=x1 - x0 - 140)
+        y = y0 + 64
+        cx = px
+        if self.edition:
+            cx += app.pill(cx, y, self.edition, fill=mix(SURFACE, self.tcol, 0.35), fg=TEXT) + 10
+        price = ASSETS.skin_price(self.uuid)
+        sub = "  ·  ".join(b for b in (s["weapon"], f"{price:,} VP" if price else None,
+                                       ASSETS.themes.get(s.get("theme") or "")) if b)
+        app.text(cx, y, sub, 10, fill=MUTED)
+        if self.owns:
+            app.pill(x1 - 64, y0 + 36, "✓ Owned", fill=mix(SURFACE, GOOD, 0.2), fg=GOOD,
+                     anchor="e")
+        self.close_btn(x1 - 34, y0 + 36)
+        # stage
+        sw, sh = self.stage_size()
+        sx0 = x0 + (x1 - x0 - sw) / 2
+        sy0 = y0 + 86
+        sx1, sy1 = sx0 + sw, sy0 + sh
+        stage_bg = mix(BG, self.tcol, 0.08)
+        app.rrect(sx0, sy0, sx1, sy1, 14, fill=stage_bg, depth=0,
+                  outline=mix(LINE, self.tcol, 0.25))
+        playing = self.player is not None
+        if playing and self.sink and self.sink.photo:
+            app.cv.create_image((sx0 + sx1) / 2, (sy0 + sy1) / 2, image=self.sink.photo)
+        elif not playing:
+            ch = s["chromas"][self.chroma_i] if s["chromas"] else {}
+            url = ch.get("render") or s["icon"]
+            if not app.image(url, (sx0 + sx1) / 2, (sy0 + sy1) / 2, sw - 80, sh - 80,
+                             anchor="center"):
+                if not (app.images and url in app.images.pending):
+                    app.text((sx0 + sx1) / 2, (sy0 + sy1) / 2, "No picture for this skin",
+                             10, fill=DIM, anchor="center")
+        if self.vstatus:
+            app.rrect((sx0 + sx1) / 2 - 110, (sy0 + sy1) / 2 - 18, (sx0 + sx1) / 2 + 110,
+                      (sy0 + sy1) / 2 + 18, 18, fill="#000000", alpha=0.55, depth=0)
+            app.text((sx0 + sx1) / 2, (sy0 + sy1) / 2, self.vstatus, 10, "bold", TEXT,
+                     anchor="center", maxw=210)
+        self.draw_controls(sx0, sy1, sx1, playing)
+        # chromas + levels
+        y = sy1 + 26
+        if len(s["chromas"]) > 1:
+            app.text(px, y, "Chromas", 8, "bold", DIM)
+            cx = px + 76
+            for i, c in enumerate(s["chromas"]):
+                own = (i == 0 and self.owns) or c["uuid"] in self.owned_chromas
+                key = self.k(f"ch:{i}")
+                on = i == self.chroma_i
+                f = app.hv(key)
+                lock = bool(self.owner) and not own
+                tip = c["name"].split("\n")[0] + ("  ·  locked" if lock else "")
+                tags = app.hit(key, click=lambda i=i: self.pick(i), tip=tip)
+                if on:
+                    app.rrect(cx - 3, y - 18, cx + 33, y + 18, 11, fill="", outline=ACCENT_HI,
+                              width=2, depth=0)
+                if not app.image(c.get("swatch"), cx, y - 15, 30, 30, radius=8, tags=tags):
+                    app.rrect(cx, y - 15, cx + 30, y + 15, 8, fill=CARD_HI, tags=tags, depth=0)
+                    app.text(cx + 15, y, str(i + 1), 9, "bold", anchor="center", tags=tags)
+                if f > 0 and not on:
+                    app.rrect(cx - 2, y - 17, cx + 32, y + 17, 10, fill="",
+                              outline=mix(SURFACE, SOFT, f), depth=0)
+                if lock:
+                    app.circle(cx + 27, y + 12, 7, fill=SURFACE, depth=0)
+                    app.icon(cx + 27, y + 12, "lock", 6, DIM)
+                cx += 42
+            ch_name = (s["chromas"][self.chroma_i].get("name") or "").split("\n")[0]
+            app.text(cx + 8, y, ch_name, 9, fill=MUTED, maxw=x1 - cx - 40)
+            y += 44
+        levels = s["levels"]
+        if len(levels) > 1 or (levels and levels[0].get("video")):
+            app.text(px, y, "Levels", 8, "bold", DIM)
+            cx = px + 76
+            for i, lv in enumerate(levels):
+                own = lv["uuid"] in self.owned_levels or (i == 0 and self.owns)
+                vid = lv.get("video")
+                label = f"{i + 1}" + (f" · {lv['item']}" if lv.get("item") else "")
+                cur = playing and self.playing_url == vid and vid
+                key = self.k(f"lv:{i}")
+                lw = app.measure(label, 9, "bold") + (40 if vid else 24)
+                if cx + lw > x1 - 28:
+                    break
+                tags = app.hit(key, click=(lambda v=vid: self.play(v)) if vid else None,
+                               tip=("Play this level's video" if vid else "No video for this level")
+                               + ("" if own or not self.owner else "  ·  not unlocked"))
+                f = app.hv(key)
+                fill = ACCENT if cur else (mix(CARD, CARD_HI, f) if vid else mix(CARD, SURFACE, 0.4))
+                app.rrect(cx, y - 15, cx + lw, y + 15, 15, fill=fill, tags=tags, depth=0.8)
+                fg = TEXT if (cur or (vid and (own or not self.owner))) else DIM
+                tx = cx + 14
+                if vid:
+                    app.icon(tx + 4, y, "play", 7, fg, tags=tags)
+                    tx += 16
+                app.text(tx, y, label, 9, "bold", fg, tags=tags)
+                cx += lw + 8
+            y += 44
+        # footer
+        fy = y1 - 30 - 38
+        on = self.uuid in app.state_["wishlist"]
+        bx = x1 - 28
+        bx -= self.button(bx, fy, "On wishlist" if on else "Add to wishlist", self.toggle_wish,
+                          "wish", "star_on" if on else "star", primary=False, anchor="e",
+                          h=38) + 10
+        active = self.owner and app.state_.get("active") == self.owner
+        if self.owns and active:
+            self.button(bx, fy, "Equip", self.equip, "equip", "check", anchor="e", h=38)
+        note = (f"Owned by {self.owner}. Log into it to equip." if self.owns and not active
+                else f"{self.owner} doesn't own this skin." if self.owner and not self.owns
+                else "")
+        if note:
+            app.text(px, fy + 19, note, 9, fill=DIM, maxw=bx - px - 200)
+
+    def draw_controls(self, sx0, sy1, sx1, playing):
+        """Bar along the bottom of the stage: play/stop, what's playing, sound, fullscreen."""
+        app = self.app
+        url = self.best_video()
+        bar_y0, bar_y1 = sy1 - 52, sy1 - 10
+        if not url and not playing:
+            return
+        app.rrect(sx0 + 10, bar_y0, sx1 - 10, bar_y1, 21, fill="#05040a", alpha=0.62, depth=0)
+        cy = (bar_y0 + bar_y1) / 2
+        # play / stop
+        key = self.k("pp")
+        f = app.hv(key)
+        tags = app.hit(key, click=self.stop_video if playing else (lambda: self.play(url)),
+                       tip="Stop" if playing else "Play preview")
+        app.circle(sx0 + 34, cy, 15 - app.pressed(key),
+                   fill=mix(ACCENT, ACCENT_HI, f), tags=tags, depth=1.0)
+        app.icon(sx0 + 35 if not playing else sx0 + 34, cy, "stop" if playing else "play", 8,
+                 "#ffffff", tags=tags)
+        lab = "Playing preview" if playing else "Play preview"
+        if playing:
+            lvl = next((f"Level {i + 1}" + (f" · {lv['item']}" if lv.get("item") else "")
+                        for i, lv in enumerate(self.skin["levels"])
+                        if lv.get("video") == self.playing_url), None)
+            ch = self.skin["chromas"][self.chroma_i] if self.skin["chromas"] else {}
+            if not lvl and ch.get("video") == self.playing_url:
+                lvl = (ch.get("name") or "Chroma").split("\n")[0]
+            lab = lvl or lab
+        app.text(sx0 + 58, cy, lab, 9, "bold", TEXT, maxw=(sx1 - sx0) / 2 - 80)
+        # fullscreen
+        fk = self.k("fs")
+        tags = app.hit(fk, click=self.fullscreen, tip="Fullscreen")
+        app.circle(sx1 - 34, cy, 14, fill=mix("#05040a", CARD_HI, app.hv(fk)), tags=tags,
+                   depth=0)
+        app.icon(sx1 - 34, cy, "fullscreen", 9, app.hcol(fk, SOFT, TEXT), tags=tags)
+        # sound: mute toggle + volume slider (remembered)
+        st = app.settings
+        vol = max(0, min(100, int(st.get("preview_volume", 60))))
+        muted = bool(st.get("preview_muted")) or vol == 0
+        tx1 = sx1 - 64
+        tx0 = tx1 - 120
+        self._vol_track = (tx0, tx1)
+        mk = self.k("mute")
+        sup = PreviewAudio.supported()
+        a = self.audio
+        why = None
+        if not sup:
+            why = ("Sound needs the video add-on (py -m pip install av)"
+                   if sys.platform == "win32" else "Sound isn't supported on this system")
+        elif a and a.status == "none":
+            why = "This preview has no sound"
+        elif a and a.status == "error":
+            why = f"Couldn't play the sound: {a.err}"
+        tags = app.hit(mk, click=self.toggle_mute if sup else None,
+                       tip=why or ("Unmute" if muted else "Mute"))
+        mx = tx0 - 22
+        app.circle(mx, cy, 14, fill=mix("#05040a", CARD_HI, app.hv(mk)), tags=tags, depth=0)
+        app.icon(mx, cy, "mute" if (muted or why) else "volume", 10,
+                 DIM if why else (GOLD if muted else app.hcol(mk, SOFT, TEXT)), tags=tags)
+        vk = self.k("vol")
+        frac = 0 if muted else vol / 100
+        tags = app.hit(vk, down=lambda x, y: self.set_volume_at(x),
+                       drag=lambda x, y: self.set_volume_at(x),
+                       click=(lambda: None), tip=why or f"Volume {0 if muted else vol}%",
+                       box=(tx0 - 6, cy - 12, tx1 + 6, cy + 12))
+        tcol = DIM if why else ACCENT_HI
+        app.rrect(tx0, cy - 2.5, tx1, cy + 2.5, 2.5, fill=mix("#05040a", SOFT, 0.25), depth=0)
+        if frac > 0:
+            app.rrect(tx0, cy - 2.5, tx0 + max(5, (tx1 - tx0) * frac), cy + 2.5, 2.5, fill=tcol,
+                      depth=0)
+        kx = tx0 + (tx1 - tx0) * frac
+        kf = max(app.hv(vk), 1.0 if (self.app.press and self.app.press[0] == vk) else 0)
+        app.circle(kx, cy, 6 + 1.5 * kf, fill="#ffffff" if not why else MUTED, depth=0.8)
+        app.text(tx1 + 2, cy - 15, "" if not playing or why or not a or a.status == "ready"
+                 else ("loading sound…" if a.status == "loading" else ""), 7, fill=DIM,
+                 anchor="e")
 
 
 class SkinPicker(Sheet):
@@ -5719,32 +7074,47 @@ WEAPON_ORDER = ["Vandal", "Phantom", "Operator", "Sheriff", "Melee", "Classic", 
                 "Stinger", "Frenzy", "Shorty", "Bandit", "Ares", "Odin"]
 
 
-class PlayerSheet(Sheet):
-    """Everything about one player in your lobby: rank, level and their whole skin loadout
-    (with chromas and gun buddies). Hidden names stay hidden."""
-    COLS, CW = 5, 132
+class PlayerLayer(Layer, ScrollBody):
+    """One player from your lobby: agent, rank, level and their whole skin loadout (with
+    chromas and buddies). Hidden names stay hidden; click a skin for its preview."""
+    W, H = 860, 660
+    CW, CH = 150, 104
 
     def __init__(self, app, p, name):
+        self.p, self.name = p, name
+        lo = p.get("loadout") or {}
+        if not lo and p.get("skins"):
+            lo = {k: {"skin": v} for k, v in p["skins"].items()}
+        rank = {n: i for i, n in enumerate(WEAPON_ORDER)}
+        rows = []
+        for wid, e in lo.items():
+            sk = ASSETS.skins.get(e.get("skin") or "")
+            wname = (ASSETS.weapons.get(wid) or {}).get("name") or (sk or {}).get("weapon", "")
+            rows.append((rank.get(wname, 99), wname, wid, e, sk))
+        rows.sort(key=lambda r: (r[0], r[1]))
+        self.rows = rows
         super().__init__(app)
-        self.app, self.p = app, p
-        self.imgs = []
-        f = tk.Frame(self, bg=SURFACE, padx=22, pady=18)
-        f.pack(fill="both")
+
+    def draw(self, x0, y0, x1, y1):
+        app, p = self.app, self.p
+        top, bot = y0 + 150, y1 - 44
+        self.glide_scroll()
+        self.draw_grid(x0 + 26, top, x1 - 26, bot)
+        self.mask(x0, y0, x1, y1, top, bot)
         ag = ASSETS.agents.get(p.get("agent") or "", {})
-        head = tk.Frame(f, bg=SURFACE)
-        head.pack(fill="x")
-        a = tk.Label(head, bg=CARD, width=8, height=4)
-        a.pack(side="left")
-        self.want(a, ag.get("icon"), 64, 64, radius=14)
         card = ASSETS.cards.get(p.get("card") or "", {})
-        if card.get("small"):
-            c = tk.Label(head, bg=SURFACE)
-            c.pack(side="left", padx=(8, 0))
-            self.want(c, card.get("small"), 64, 64, radius=14)
-        info = tk.Frame(head, bg=SURFACE)
-        info.pack(side="left", padx=14)
-        tk.Label(info, text=name, bg=SURFACE, fg=TEXT if p.get("name") else MUTED,
-                 font=(app.UI, 15, "bold"), anchor="w").pack(fill="x")
+        ban = (x0 + 8, y0 + 8, x1 - 8, y0 + 116)
+        if not app.image(card.get("wide"), ban[0], ban[1], ban[2] - ban[0], ban[3] - ban[1],
+                         mode="cover", radius=14, fade=True):
+            app.rrect(*ban, 14, fill=mix(SURFACE, ACCENT, 0.15), depth=0)
+        A = 74
+        ax, ay = x0 + 30, y0 + 58
+        app.rrect(ax - 5, ay - 5, ax + A + 5, ay + A + 5, 20, fill=SURFACE, depth=0)
+        if not app.image(ag.get("icon"), ax, ay, A, A, radius=16):
+            app.letter_avatar(ax, ay, A, self.name or "?", radius=16)
+        nx = ax + A + 18
+        app.text(nx, y0 + 108, self.name, 16, "bold", TEXT if p.get("name") else MUTED,
+                 maxw=x1 - nx - 300)
         bits = [ag.get("name") or "No agent yet"]
         if p.get("level"):
             bits.append(f"Level {p['level']}")
@@ -5757,242 +7127,77 @@ class PlayerSheet(Sheet):
             bits.append("Your party")
         elif p.get("ally") is False:
             bits.append("Enemy team")
-        tk.Label(info, text="  ·  ".join(bits), bg=SURFACE, fg=MUTED, font=(app.UI, 9),
-                 anchor="w").pack(fill="x", pady=(2, 0))
-        rk = tk.Frame(head, bg=SURFACE)
-        rk.pack(side="right")
+        app.text(nx, y0 + 132, "  ·  ".join(bits), 9, fill=MUTED, maxw=x1 - nx - 300)
         hide = app.settings.get("focus_mode") and not p.get("me")
-        for t, label, rr in ((p.get("tier", 0), "Current", p.get("rr")),
-                             (p.get("peak", 0), "Peak", None)):
-            box = tk.Frame(rk, bg=CARD, padx=10, pady=6)
-            box.pack(side="left", padx=(8, 0))
-            ic = tk.Label(box, bg=CARD)
-            ic.pack(side="left")
+        bx = x1 - 30
+        for t, label, rr in ((p.get("peak", 0), "Peak", None), (p.get("tier", 0), "Current",
+                                                                   p.get("rr"))):
+            w = 176
+            app.rrect(bx - w, y0 + 100, bx, y0 + 142, 12, fill=mix(SURFACE, CARD, 0.5),
+                      outline=LINE)
             if t >= 3 and not hide:
-                self.want(ic, ASSETS.tier_icon(t), 30, 30)
-            txt = tk.Frame(box, bg=CARD)
-            txt.pack(side="left", padx=(6, 0))
-            tk.Label(txt, text=label, bg=CARD, fg=DIM, font=(app.UI, 7, "bold"),
-                     anchor="w").pack(fill="x")
-            name_t = "Hidden" if hide else ASSETS.tier_name(t)
+                app.rank_icon(t, bx - w + 22, y0 + 121, 26)
+            app.text(bx - w + 42, y0 + 112, label, 7, "bold", DIM)
+            nm = "Hidden" if hide else ASSETS.tier_name(t)
             if rr is not None and t >= 3 and not hide:
-                name_t += f" · {rr} RR"
-            tk.Label(txt, text=name_t, bg=CARD,
-                     fg=mix(ASSETS.tier_color(t) or MUTED, "#ffffff", 0.35) if not hide else DIM,
-                     font=(app.UI, 9, "bold"), anchor="w").pack(fill="x")
+                nm += f" · {rr} RR"
+            app.text(bx - w + 42, y0 + 129, nm, 9, "bold",
+                     mix(ASSETS.tier_color(t) or MUTED, "#ffffff", 0.35) if not hide else DIM,
+                     maxw=w - 50)
+            bx -= w + 10
+        fancy = sum(1 for r in self.rows if r[4] and not r[4].get("standard"))
+        val = sum(ASSETS.skin_price(r[4]["uuid"]) or 0 for r in self.rows if r[4])
+        app.text(x0 + 26, y1 - 22, f"{fancy} skinned weapons" + (f"  ·  about {val:,} VP equipped"
+                                                                  if val else "")
+                 + "  ·  click a skin for its preview", 8, fill=DIM)
+        self.close_btn(x1 - 34, y0 + 34)
 
-        lo = p.get("loadout") or {}
-        if not lo and p.get("skins"):
-            lo = {k: {"skin": v} for k, v in p["skins"].items()}
-        tk.Label(f, text="Loadout", bg=SURFACE, fg=MUTED, font=(app.UI, 9, "bold"),
-                 anchor="w").pack(fill="x", pady=(16, 6))
-        if not lo:
-            tk.Label(f, text="Skins show up once the match has loaded their loadout.",
-                     bg=SURFACE, fg=DIM, font=(app.UI, 10), anchor="w").pack(fill="x", pady=8)
-        else:
-            grid = tk.Frame(f, bg=SURFACE)
-            grid.pack(fill="x")
-            rank = {n: i for i, n in enumerate(WEAPON_ORDER)}
-            rows = []
-            for wid, e in lo.items():
-                s = ASSETS.skins.get(e.get("skin") or "")
-                wname = (ASSETS.weapons.get(wid) or {}).get("name") or (s or {}).get("weapon", "")
-                rows.append((rank.get(wname, 99), wname, wid, e, s))
-            rows.sort(key=lambda r: (r[0], r[1]))
-            for i, (_, wname, wid, e, s) in enumerate(rows):
-                self.cell(grid, i, wname, e, s)
-            fancy = sum(1 for r in rows if r[4] and not r[4].get("standard"))
-            val = sum(ASSETS.skin_price(r[4]["uuid"]) or 0 for r in rows if r[4])
-            tk.Label(f, text=f"{fancy} skinned weapons" + (f"  ·  about {val:,} VP equipped"
-                                                           if val else "")
-                     + "  ·  click a skin for details", bg=SURFACE, fg=DIM,
-                     font=(app.UI, 8), anchor="w").pack(fill="x", pady=(10, 0))
-        bar = tk.Frame(f, bg=SURFACE)
-        bar.pack(fill="x", pady=(14, 0))
-        app.button(bar, "Close", CARD, self.destroy).pack(side="right")
-        self.bind("<Escape>", lambda e: self.destroy())
-        if app.images:
-            app.images.listeners.add(self.refresh)
-        self.refresh()
-        app.center(self)
-
-    def want(self, label, url, w, h, **kw):
-        self.imgs.append((label, url, w, h, kw))
-
-    def cell(self, grid, i, wname, e, s):
+    def draw_grid(self, x0, top, x1, bot):
         app = self.app
-        std = not s or s.get("standard")
-        cell = tk.Frame(grid, bg=CARD, width=self.CW, height=86, cursor="" if std else "hand2")
-        cell.grid(row=i // self.COLS, column=i % self.COLS, padx=3, pady=3)
-        cell.pack_propagate(False)
-        url = None
-        if s:
-            url = s["icon"]
-            ch = next((c for c in s.get("chromas") or [] if c["uuid"] == e.get("chroma")), None)
-            if ch and s["chromas"] and ch is not s["chromas"][0] and ch.get("render"):
-                url = ch["render"]
-        img = tk.Label(cell, bg=CARD)
-        img.pack(pady=(8, 0))
-        self.want(img, url, 116, 40)
-        tcol = ASSETS.ctiers.get((s or {}).get("tier") or "", {}).get("color") if s else None
-        tk.Label(cell, text=(s["name"] if s and not std else f"Standard {wname}"), bg=CARD,
-                 fg=TEXT if not std else DIM, font=(app.UI, 8, "bold"),
-                 wraplength=self.CW - 12).pack(pady=(4, 0))
-        if tcol and not std:
-            tk.Frame(cell, bg=tcol, height=2).place(relx=0, rely=1, relwidth=1, anchor="sw")
-        bud = ASSETS.buddy_levels.get(e.get("buddy") or "")
-        if bud:
-            b = tk.Label(cell, bg=CARD)
-            b.place(x=self.CW - 26, y=4)
-            self.want(b, bud.get("icon"), 22, 22)
-        if not std:
-            wid_all = [cell] + cell.winfo_children()
-            for wdg in wid_all:
-                wdg.bind("<Button-1>", lambda ev, su=s["uuid"]: SkinDialog(app, su))
-                wdg.bind("<Enter>", lambda ev, c=cell: self._hl(c, CARD_HI))
-                wdg.bind("<Leave>", lambda ev, c=cell: self._hl(c, CARD))
-
-    def _hl(self, c, col):
-        for x in [c] + c.winfo_children():
-            try:
-                if x.winfo_class() in ("Frame", "Label") and x.cget("height") != 2:
-                    x.config(bg=col)
-            except tk.TclError:
-                pass
-
-    def refresh(self):
-        if self._closing or not self.app.images:
+        y = top + 12 - self.scroll
+        if not self.rows:
+            app.text((x0 + x1) / 2, top + 60, "Skins show up once the match has loaded their "
+                     "loadout.", 10, fill=MUTED, anchor="center")
+            self.max_scroll = 0
             return
-        for label, url, w, h, kw in self.imgs:
-            if not url:
+        cols = max(1, int((x1 - x0 + 10) // (self.CW + 10)))
+        cw = (x1 - x0 - 10 * (cols - 1)) / cols
+        for i, (_, wname, wid, e, sk) in enumerate(self.rows):
+            cx = x0 + (i % cols) * (cw + 10)
+            cy = y + (i // cols) * (self.CH + 10)
+            if not self.vis(cy, cy + self.CH, top, bot):
                 continue
-            try:
-                if getattr(label, "image", None) is not None or not label.winfo_exists():
-                    continue
-                im = self.app.images.get(url, w, h, **kw)
-                if im:
-                    label.config(image=im, width=w, height=h)
-                    label.image = im
-            except tk.TclError:
-                pass
-
-    def destroy(self):
-        if self.app.images:
-            self.app.images.listeners.discard(self.refresh)
-        super().destroy()
-
-
-class MatchSheet(Sheet):
-    """Full scoreboard + round-by-round strip for one match (ValPaw-style)."""
-    LEGEND = "E eliminated · B spike went off · D defused · T time ran out  ·  hover a round"
-
-    def __init__(self, app, det):
-        super().__init__(app)
-        self.app, self.imgs = app, []
-        self.want = lambda lab, url, w, h, **kw: self.imgs.append((lab, url, w, h, kw))
-        f = tk.Frame(self, bg=SURFACE, padx=22, pady=18)
-        f.pack(fill="both")
-        won = det["won"]
-        col = GOOD if won is True else (DANGER if won is False else MUTED)
-        head = tk.Frame(f, bg=SURFACE)
-        head.pack(fill="x")
-        mp = ASSETS.maps.get(det["map"], {})
-        mi = tk.Label(head, bg=CARD)
-        mi.pack(side="left")
-        self.want(mi, mp.get("icon") or mp.get("splash"), 150, 56, radius=12, mode="cover")
-        info = tk.Frame(head, bg=SURFACE)
-        info.pack(side="left", padx=14)
-        res = "Victory" if won is True else ("Defeat" if won is False else "Draw")
-        a, b = det["score"]
-        tk.Label(info, text=f"{res}" + (f"   {a} – {b}" if a is not None else ""), bg=SURFACE,
-                 fg=col, font=(app.UI, 16, "bold"), anchor="w").pack(fill="x")
-        mins = int(det["length"] // 60)
-        tk.Label(info, text="  ·  ".join(x for x in (mp.get("name"), det["queue"],
-                                                    ago(det["start"], ""),
-                                                    f"{mins} min" if mins else "") if x),
-                 bg=SURFACE, fg=MUTED, font=(app.UI, 9), anchor="w").pack(fill="x")
-        if det["rounds"]:
-            tk.Label(f, text="Rounds", bg=SURFACE, fg=MUTED, font=(app.UI, 9, "bold"),
-                     anchor="w").pack(fill="x", pady=(14, 4))
-            strip = tk.Frame(f, bg=SURFACE)
-            strip.pack(fill="x")
-            for i, r in enumerate(det["rounds"]):
-                c = GOOD if r["won"] else DANGER
-                cell = tk.Label(strip, text=r["short"], bg=mix(SURFACE, c, 0.35), fg=TEXT,
-                                font=(app.UI, 8, "bold"), width=2, pady=3)
-                cell.grid(row=0, column=i + (1 if i >= 12 else 0), padx=1)
-                if i == 11:
-                    tk.Frame(strip, bg=SURFACE, width=8).grid(row=0, column=12)
-                txt = (f"Round {r['n']}: {'won' if r['won'] else 'lost'}  ·  {r['long']}"
-                       + (f"  ·  spike planted on {r['site']}" if r['site'] else ""))
-                cell.bind("<Enter>", lambda e, t=txt: self.cap.config(text=t, fg=SOFT))
-                cell.bind("<Leave>", lambda e: self.cap.config(text=self.LEGEND, fg=DIM))
-            self.cap = tk.Label(f, text=self.LEGEND, bg=SURFACE, fg=DIM, font=(app.UI, 7),
-                                anchor="w")
-            self.cap.pack(fill="x", pady=(3, 0))
-        cols = [("", 30), ("Player", 190), ("", 30), ("ACS", 46), ("K / D / A", 84),
-                ("+/-", 40), ("HS%", 46), ("ADR", 46), ("DD", 46), ("FB", 32)]
-        for tab in det["teams"]:
-            tcol = GOOD if tab["won"] is True else (DANGER if tab["won"] is False else MUTED)
-            hdr = tk.Frame(f, bg=SURFACE)
-            hdr.pack(fill="x", pady=(14, 4))
-            tk.Label(hdr, text=tab["label"], bg=SURFACE, fg=tcol, font=(app.UI, 10, "bold"),
-                     anchor="w").pack(side="left")
-            if tab["rounds"] is not None:
-                tk.Label(hdr, text=f"  {tab['rounds']} rounds", bg=SURFACE, fg=DIM,
-                         font=(app.UI, 8)).pack(side="left")
-            tbl = tk.Frame(f, bg=SURFACE)
-            tbl.pack(fill="x")
-            for ci, (lab, w) in enumerate(cols):
-                tk.Label(tbl, text=lab, bg=SURFACE, fg=DIM, font=(app.UI, 7, "bold"),
-                         anchor="w" if ci in (1,) else "center").grid(row=0, column=ci,
-                                                                      sticky="we")
-                tbl.grid_columnconfigure(ci, minsize=w)
-            for ri, r in enumerate(tab["rows"], 1):
-                bg = mix(SURFACE, ACCENT, 0.18) if r["me"] else (CARD if ri % 2 else SURFACE)
-                ag = ASSETS.agents.get(r["agent"], {})
-                cells = []
-                il = tk.Label(tbl, bg=bg)
-                self.want(il, ag.get("icon"), 24, 24, radius=6)
-                cells.append(il)
-                nm = r["name"] + ("  (you)" if r["me"] else "")
-                cells.append(tk.Label(tbl, text=nm, bg=bg, fg=TEXT if r["named"] else MUTED,
-                                      font=(app.UI, 9, "bold" if r["me"] or r["party"] else ""),
-                                      anchor="w"))
-                rl = tk.Label(tbl, bg=bg)
-                if r["tier"] >= 3 and not (app.settings.get("focus_mode") and not r["me"]):
-                    self.want(rl, ASSETS.tier_icon(r["tier"]), 22, 22)
-                cells.append(rl)
-                diff = r["k"] - r["d"]
-                for txt, fg in ((str(r["acs"]), TEXT), (f"{r['k']} / {r['d']} / {r['a']}", TEXT),
-                                (f"{diff:+d}", GOOD if diff > 0 else (DANGER if diff < 0 else MUTED)),
-                                (f"{r['hs']:.0f}%" if r["hs"] is not None else "—", SOFT),
-                                (str(r["adr"]) if r["adr"] is not None else "—", SOFT),
-                                (f"{r['dd']:+d}" if r.get("dd") is not None else "—",
-                                 GOOD if (r.get("dd") or 0) > 0 else (DANGER if (r.get("dd") or 0) < 0
-                                                                      else SOFT)),
-                                (str(r["fb"]), SOFT)):
-                    cells.append(tk.Label(tbl, text=txt, bg=bg, fg=fg, font=(app.UI, 9, "bold")))
-                for ci, c in enumerate(cells):
-                    c.grid(row=ri, column=ci, sticky="nswe", ipady=4)
-        tk.Label(f, text="Names show for you, your party and your saved accounts; everyone else "
-                 "is shown by agent.", bg=SURFACE, fg=DIM, font=(app.UI, 7),
-                 anchor="w").pack(fill="x", pady=(10, 0))
-        bar = tk.Frame(f, bg=SURFACE)
-        bar.pack(fill="x", pady=(12, 0))
-        app.button(bar, "Close", CARD, self.destroy).pack(side="right")
-        self.bind("<Escape>", lambda e: self.destroy())
-        if app.images:
-            app.images.listeners.add(self.refresh)
-        self.refresh()
-        app.center(self)
-
-    refresh = PlayerSheet.refresh
-
-    def destroy(self):
-        if self.app.images:
-            self.app.images.listeners.discard(self.refresh)
-        super().destroy()
+            std = not sk or sk.get("standard")
+            key = self.k(f"sk:{i}")
+            f = app.hv(key) if not std else 0
+            self.row_box(key, cx, cy, cx + cw, cy + self.CH, top, bot,
+                         (lambda su=sk["uuid"]: SkinDialog(app, su)) if not std else None,
+                         tip=None if std else "Preview")
+            tcol = ASSETS.ctiers.get((sk or {}).get("tier") or "", {}).get("color") if sk else None
+            app.rrect(cx, cy, cx + cw, cy + self.CH, 12,
+                      fill=mix(mix(SURFACE, CARD, 0.45), CARD_HI, 0.6 * f),
+                      outline=mix(LINE, tcol or SOFT, 0.3 + 0.4 * f) if not std else LINE)
+            url = None
+            if sk:
+                url = sk["icon"]
+                ch = next((c for c in sk.get("chromas") or [] if c["uuid"] == e.get("chroma")),
+                          None)
+                if ch and sk["chromas"] and ch is not sk["chromas"][0] and ch.get("render"):
+                    url = ch["render"]
+            app.image(url, cx + cw / 2, cy + 38, cw - 24, 44, anchor="center")
+            nm = sk["name"] if sk and not std else f"Standard {wname}"
+            app.text(cx + cw / 2, cy + self.CH - 22, nm, 8, "bold", TEXT if not std else DIM,
+                     anchor="center", maxw=cw - 16)
+            if tcol and not std:
+                app.rrect(cx + 14, cy + self.CH - 4, cx + cw - 14, cy + self.CH - 2, 1,
+                          fill=tcol, depth=0)
+            bud = ASSETS.buddy_levels.get(e.get("buddy") or "")
+            if bud:
+                app.image(bud.get("icon"), cx + cw - 30, cy + 6, 24, 24)
+        n = len(self.rows)
+        y += ((n - 1) // cols + 1) * (self.CH + 10)
+        self.max_scroll = max(0.0, (y + self.scroll) - bot + 6)
+        self.scroll_t = min(self.scroll_t, self.max_scroll)
 
 
 OBS_PAGE = """<!doctype html><html><head><meta charset="utf-8"><style>
@@ -6481,6 +7686,7 @@ class App(tk.Tk):
         self._more = self._shimmer = False
         self._ovl_more = self._ovl_loop = False
         self.sheets, self._bd, self._sheet_loop = [], None, False
+        self.layers = []
         self._bd_frames, self._bd_raw, self._bd_final = {}, None, None
         self._routed, self._appkeys = set(), {}
         self.pop = None
@@ -6623,9 +7829,19 @@ class App(tk.Tk):
     def is_hidden(self):
         return self.state() == "withdrawn"
 
+    def save_soon(self, delay=500):
+        """Save settings once things settle (e.g. while a slider is being dragged)."""
+        if getattr(self, "_save_job", None):
+            try:
+                self.after_cancel(self._save_job)
+            except Exception:
+                pass
+        self._save_job = self.after(delay, lambda: (setattr(self, "_save_job", None),
+                                                    save_state(self.state_)))
+
     def play_ui(self, name):
         """Optional, very quiet interface sounds (Settings > Appearance, off by default)."""
-        if not self.settings.get("ui_sounds"):
+        if not self.settings.get("ui_sounds") or PreviewAudio.current is not None:
             return
         now = time.time()
         if now - getattr(self, "_snd_t", 0) < 0.05:
@@ -6747,6 +7963,27 @@ class App(tk.Tk):
 
     def measure(self, s, size=10, weight="normal"):
         return self.fobj(size, weight).measure(s)
+
+    def wrap(self, s, size, maxw, weight="normal", max_lines=None):
+        """Word-wrap text to a width (in pixels) using the real font metrics."""
+        out = []
+        fo = self.fobj(size, weight)
+        for para in str(s or "").split("\n"):
+            line = ""
+            for word in para.split(" "):
+                t = (line + " " + word).strip()
+                if fo.measure(t) <= maxw or not line:
+                    line = t
+                else:
+                    out.append(line)
+                    line = word
+            out.append(line)
+        if max_lines and len(out) > max_lines:
+            out = out[:max_lines]
+            while out[-1] and fo.measure(out[-1] + "…") > maxw:
+                out[-1] = out[-1][:-1]
+            out[-1] += "…"
+        return out
 
     def shape_img(self, w, h, r, fill, outline, width, depth=0.0, alpha=1.0):
         """Anti-aliased rounded rectangle as a cached image (Tk polygons are jagged).
@@ -6923,8 +8160,10 @@ class App(tk.Tk):
         self.text(x + w / 2, y, label, size, "bold", fg or MUTED, anchor="center", tags=tags)
         return w
 
-    def hit(self, key, click=None, dbl=None, right=None, tip=None, box=None):
-        self.hits[key] = {"click": click, "dbl": dbl, "right": right, "tip": tip}
+    def hit(self, key, click=None, dbl=None, right=None, tip=None, box=None, down=None,
+            drag=None):
+        self.hits[key] = {"click": click, "dbl": dbl, "right": right, "tip": tip,
+                          "down": down, "drag": drag}
         if box:
             self.hit_boxes.append((box, key))
         return ("hit:" + key,)
@@ -7250,7 +8489,15 @@ class App(tk.Tk):
             had_focus = self.focus_get() is self.search
         except Exception:
             had_focus = False
+        try:
+            foc = self.focus_get()
+        except Exception:
+            foc = None
         c.delete("all")
+        for L in self.layers:
+            L.entries = {n: (e, None) for n, (e, _) in L.entries.items()}
+        self._refocus = foc if any(foc is e for L in self.layers
+                                   for e, _ in L.entries.values()) else None
         self.hits = {}
         self.hit_boxes = []
         self.search_shown = False
@@ -7306,10 +8553,33 @@ class App(tk.Tk):
             self.draw_drag_ghost()
         self.draw_sidebar(w, h)
         self.draw_bottom(w, h)
+        self._hb_lyr = len(self.hit_boxes)
+        lyr_more = lyr_shim = False
+        if self.layers:
+            self._more = self._shimmer = False        # the page is frozen under a dialog
+            lmark = (c.find_all() or (0,))[-1]
+            self.draw_layers(w, h)
+            for item in c.find_all():
+                if item > lmark and "lyrwin" not in c.gettags(item):
+                    c.addtag_withtag("lyr", item)
+            lyr_more, lyr_shim = self._more, self._shimmer
+            self._more = self._shimmer = False
         self._hb_base = len(self.hit_boxes)
         self.draw_overlays()
+        if lyr_more:
+            self.after(16, self.layer_redraw)
+        elif lyr_shim:
+            self.after(60, self.layer_redraw)
         if had_focus and self.search_shown:
             self.search.focus_set()
+        if getattr(self, "_refocus", None) is not None:
+            try:
+                self._refocus.focus_set()
+            except tk.TclError:
+                pass
+            self._refocus = None
+        if self.sheets:          # covered by a dialog: don't spend frames on the page
+            self._more = self._shimmer = False
         if self._more:
             self.after(16, self.redraw)
         elif self._shimmer:
@@ -7483,6 +8753,14 @@ class App(tk.Tk):
 
     def place_search(self, x_right, y, width=220, hint="Search"):
         h = self.cv.winfo_height()
+        if self.layers:
+            if 8 < y < h - self.BOTTOM - 30:
+                self.rrect(x_right - width, y - 17, x_right, y + 17, 17, fill=CARD,
+                           outline=LINE, width=1)
+                self.icon(x_right - width + 18, y, "search", 10, DIM)
+                self.text(x_right - width + 34, y, self.search_var.get() or hint, 10,
+                          fill=TEXT if self.search_var.get() else DIM, maxw=width - 48)
+            return
         if 8 < y < h - self.BOTTOM - 30:
             x0 = x_right - width
             focused = self.focus_get() is self.search
@@ -7509,6 +8787,172 @@ class App(tk.Tk):
         if sub:
             self.text(x0 + 54 + self.measure(title, 20, "bold"), y + 18, sub, 10, fill=DIM,
                       maxw=x1 - x0 - 420)
+
+    # ------------------------------------------------------------ in-canvas layers
+    LAYER_IN, LAYER_OUT = 0.22, 0.15
+
+    def push_layer(self, L):
+        self.close_pop()
+        if self.is_hidden():
+            # straight deiconify: show_window() asks for the PIN, which is itself a layer
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        first = not self.layers
+        self.layers.append(L)
+        for other in self.layers[:-1]:
+            other.hide_entries()
+        if first:
+            self.hover = None
+            self.press = None
+            self.cv.config(cursor="")
+        self.redraw()
+
+    def layer_closing(self, L):
+        if not self.settings.get("animations", True):
+            self.remove_layer(L)
+        else:
+            self.layer_redraw()
+
+    def remove_layer(self, L):
+        if L.closed:
+            return
+        L.closed = True
+        if L in self.layers:
+            self.layers.remove(L)
+        try:
+            L.cleanup()
+        except Exception as e:
+            self.log(f"layer cleanup: {e!r}")
+        self.hover = None
+        self.press = None
+        try:
+            self.cv.focus_set()
+        except tk.TclError:
+            pass
+        self.redraw()
+
+    def close_layers(self):
+        for L in list(self.layers):
+            L.close()
+
+    def top_layer(self):
+        live = [L for L in self.layers if L.tc is None]
+        return live[-1] if live else None
+
+    def scrim_photo(self, w, h, n):
+        """Dark veil over the page behind a dialog, at one of 4 strengths (cached)."""
+        if not HAS_PIL or n <= 0:
+            return None
+        cache = self.__dict__.setdefault("_scrims", {})
+        if cache.get("size") != (w, h, BG):
+            cache.clear()
+            cache["size"] = (w, h, BG)
+        ph = cache.get(n)
+        if ph is None:
+            im = Image.new("RGBA", (w, h), _rgb(mix(BG, "#000000", 0.4)) + (int(150 * n / 4),))
+            ph = cache[n] = ImageTk.PhotoImage(im)
+        return ph
+
+    def draw_layers(self, w, h):
+        now = time.time()
+        anim = self.settings.get("animations", True)
+        live = [L for L in self.layers if not L.closed]
+        top = self.top_layer()
+        for L in live:
+            k = 1.0 if not anim else ease_out_quint((now - L.t0) / self.LAYER_IN)
+            if L.tc is not None:
+                c = 1.0 if not anim else (now - L.tc) / self.LAYER_OUT
+                if c >= 1:
+                    if not getattr(L, "_removing", False):
+                        L._removing = True
+                        self.after_idle(lambda L=L: self.remove_layer(L))
+                    L.hide_entries()
+                    continue
+                k = min(k, 1 - ease_in_out(c))
+            if k < 1:
+                self._more = True
+            if getattr(L, "opaque", False):       # lock screen: hide everything behind it
+                self.cv.create_rectangle(0, 0, w, h, fill=mix(BG, "#000000", 0.3), outline="")
+            else:
+                sc = self.scrim_photo(w, h, max(1, round(k * 4)))
+                if sc:
+                    self.cv.create_image(0, 0, image=sc, anchor="nw")
+            pw, ph = (int(v) for v in L.size(w, h))
+            x0 = int((w - pw) / 2)
+            y0 = int(max(16, (h - ph) / 2 - 6) + round((1 - k) * 18))
+            x1, y1 = x0 + pw, y0 + ph
+            L.box = (x0, y0, x1, y1)
+            self.soft(x0, y0, x1, y1, 20, "#000000", alpha=int(170 * k), spread=26, dy=14)
+            self.rrect(x0, y0, x1, y1, 20, fill=SURFACE,
+                       outline=mix(LINE, "#ffffff", 0.09), depth=0)
+            # the light catching the panel's top edge
+            self.rrect(x0 + 18, y0, x1 - 18, y0 + 1.2, 0.6, fill=mix(SURFACE, "#ffffff", 0.16),
+                       depth=0)
+            if L is not top:
+                L.hide_entries()
+            try:
+                L.draw(x0, y0, x1, y1)
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                if getattr(L, "_last_err", None) != tb:
+                    L._last_err = tb
+                    self.log(f"layer {type(L).__name__}: {tb}")
+                self.text((x0 + x1) / 2, (y0 + y1) / 2 - 10, "Something went wrong here", 13,
+                          "bold", DANGER, anchor="center")
+                self.text((x0 + x1) / 2, (y0 + y1) / 2 + 14, f"{type(e).__name__}: {e}", 9,
+                          fill=MUTED, anchor="center", maxw=pw - 60)
+                L.close_btn(x1 - 30, y0 + 30)
+            if k < 1:       # fade the contents in with the panel
+                self.rrect(x0 + 1, y0 + 1, x1 - 1, y1 - 1, 19, fill=SURFACE, depth=0,
+                           alpha=round((1 - k) * 6) / 6)
+
+    def layer_redraw(self):
+        """Redraw only the layers (and toasts/menus above them) - never the page."""
+        if not self.layers:
+            self.redraw()
+            return
+        if self._pending or getattr(self, "_lyr_pending", False):
+            return
+        self._lyr_pending = True
+        self.after_idle(self._layer_draw)
+
+    def _layer_draw(self):
+        self._lyr_pending = False
+        if self._pending:
+            return                      # a full redraw is on its way anyway
+        c = self.cv
+        c.delete("lyr")
+        c.delete("ovl")
+        base = getattr(self, "_hb_lyr", None)
+        if base is not None:
+            del self.hit_boxes[base:]
+        w, h = max(c.winfo_width(), 400), max(c.winfo_height(), 300)
+        saved = (self._more, self._shimmer)
+        self._more = self._shimmer = False
+        marker = (c.find_all() or (0,))[-1]
+        self.draw_layers(w, h)
+        for item in c.find_all():
+            if item > marker and "lyrwin" not in c.gettags(item):
+                c.addtag_withtag("lyr", item)
+        more, shim = self._more, self._shimmer
+        self._more, self._shimmer = saved
+        self._hb_base = len(self.hit_boxes)
+        self.draw_overlays()
+        if more:
+            self.after(16, self.layer_redraw)
+        elif shim:
+            self.after(60, self.layer_redraw)
+
+    def key_ok(self, key):
+        """While a layer is open, only its own controls (and toasts/menus) respond."""
+        if not key:
+            return False
+        top = self.top_layer()
+        if not self.layers or top is None:
+            return not self.layers or key.startswith(("toast:", "pop:"))
+        return key.startswith((top.kp, "toast:", "pop:"))
 
     # ------------------------------------------------------------ in-app sheets
     def sheet_push(self, sh):
@@ -7543,7 +8987,7 @@ class App(tk.Tk):
         self._bd_final = None
         if raw is not None:
             from PIL import ImageFilter
-            k = 5
+            k = 6
             small = raw.resize((max(1, W // k), max(1, H // k)), Image.BILINEAR)
             small = small.filter(ImageFilter.GaussianBlur(3.2))
             blur = small.resize((W, H), Image.BICUBIC)
@@ -7563,7 +9007,7 @@ class App(tk.Tk):
     def _bd_show(self, lvl):
         if self._bd is None or self._bd_final is None:
             return
-        n = 7
+        n = 2           # raw -> halfway -> final: each frame is a full-window image
         k = max(0, min(n, round(lvl * n)))
         ph = self._bd_frames.get(k)
         if ph is None:
@@ -7621,7 +9065,7 @@ class App(tk.Tk):
         ImageDraw.Draw(a).rounded_rectangle((SH, SH + 12, W - SH, H - SH + 12), R, fill=175)
         a = a.filter(ImageFilter.GaussianBlur(SH / 2.0))
         im = Image.merge("RGBA", (Image.new("L", (W, H), 0),) * 3 + (a,))
-        ss = 3
+        ss = 2
         big = Image.new("RGBA", (W * ss, H * ss), (0, 0, 0, 0))
         ImageDraw.Draw(big).rounded_rectangle(
             (SH * ss, SH * ss, (W - SH) * ss - 1, (H - SH) * ss - 1), R * ss,
@@ -7669,9 +9113,18 @@ class App(tk.Tk):
                 more = sh.step(now) or more
             except tk.TclError:
                 pass
+            except Exception as e:      # never let one dialog freeze the others
+                self.log(f"sheet anim: {e!r}")
+                try:
+                    sh._vis = sh._to
+                    sh._apply()
+                    if sh._closing:
+                        sh._final()
+                except Exception:
+                    pass
         if more:
             self._sheet_loop = True
-            self.after(8, self._sheet_tick)
+            self.after(16, self._sheet_tick)
 
     def _sheets_relayout(self):
         for sh in self.sheets:
@@ -7698,6 +9151,11 @@ class App(tk.Tk):
         if self.pop and seq in ("<Escape>", "<Up>", "<Down>", "<Return>"):
             self.pop_key(seq)
             return "break"
+        if self.layers:
+            top = self.top_layer()
+            if top and top.on_key(seq, e):
+                return "break"
+            return None          # pages don't react to keys under a dialog
         fn = self._appkeys.get(seq)
         if fn:
             return fn(e)
@@ -8657,11 +10115,13 @@ class App(tk.Tk):
             self.text(x + 8 + bw / 2, y + 19, lab, 8, "bold", fg, anchor="center",
                       maxw=bw - 10, tags=tags)
         if self.settings.get("hotkeys") and idx < 9 and f > 0:
+            # top-right, under the colour dot: clear of the status badge and the play button
             lab = f"Ctrl+Alt+{idx + 1}"
             bw = self.measure(lab, 8, "bold") + 14
-            self.rrect(x + T - 8 - bw, y + T - 64, x + T - 8, y + T - 42, 11,
-                       fill=mix(BG, "#0c0917", f), tags=tags)
-            self.text(x + T - 8 - bw / 2, y + T - 53, lab, 8, "bold", mix(BG, MUTED, f),
+            hy = y + (30 if lc else 8)
+            self.rrect(x + T - 8 - bw, hy, x + T - 8, hy + 20, 10,
+                       fill="#0c0917", alpha=round(0.85 * f, 2), depth=0, tags=tags)
+            self.text(x + T - 8 - bw / 2, hy + 10, lab, 8, "bold", mix("#0c0917", SOFT, f),
                       anchor="center", tags=tags)
         tier = m.get("tier")
         if tier and tier >= 3 and self.images:
@@ -10719,7 +12179,7 @@ class App(tk.Tk):
         return name
 
     def open_player(self, p):
-        PlayerSheet(self, p, self.player_display_name(p))
+        PlayerLayer(self, p, self.player_display_name(p))
 
     def open_match(self, m, mt):
         f = MATCH_DIR / f"{mt.get('id')}.json"
@@ -10768,7 +12228,7 @@ class App(tk.Tk):
                 for r in t["rows"]:
                     if not r["me"]:
                         r["name"] = (ASSETS.agents.get(r["agent"]) or {}).get("name") or "Player"
-        MatchSheet(self, det)
+        MatchLayer(self, det)
 
     # ---- agent picker / tab overlay
     def open_picker(self):
@@ -10969,8 +12429,9 @@ class App(tk.Tk):
         if stale and not getattr(self, "friends_busy", False):
             self.friends_t = now
             self.refresh_social()
-        if self.friends is None or self.friends_err:
-            self.after(15500, self.redraw)
+        if (self.friends is None or self.friends_err) and not getattr(self, "_fr_retry", None):
+            self._fr_retry = self.after(15500, lambda: (setattr(self, "_fr_retry", None),
+                                                        self.redraw()))
         fr = self.friends or []
         online = [f for f in fr if f["online"]]
         self.section(x0, y, "person", "Friends", f"{len(online)} online of {len(fr)}  ·  "
@@ -11002,9 +12463,8 @@ class App(tk.Tk):
                 col = GOOD if f["online"] and f["state"] in ("chat", "dnd") else (
                     GOLD if f["online"] else DIM)
                 rk = "frow:" + str(f["puuid"])
-                rt = self.hit(rk, click=(lambda f=f: ChatSheet(self, f)) if f.get("pid")
-                              else None, tip="Message" if f.get("pid") else None,
-                              box=(cx, cy, cx + cw, cy + 50))
+                rt = self.hit(rk, click=lambda f=f: FriendLayer(self, f),
+                              tip="Profile and messages", box=(cx, cy, cx + cw, cy + 50))
                 base = SURFACE if f["online"] else mix(SURFACE, BG, 0.4)
                 self.rrect(cx, cy, cx + cw, cy + 50, 14, fill=self.hcol(rk, base, CARD),
                            outline=LINE, tags=rt)
@@ -11025,8 +12485,9 @@ class App(tk.Tk):
                           GOLD if on else self.hcol(key, DIM, SOFT), tags=tg)
                 if f.get("pid"):
                     mk = "fmsg:" + str(f["puuid"])
-                    mt = self.hit(mk, click=lambda f=f: ChatSheet(self, f), tip="Message",
-                                  box=(cx + cw - 68, cy + 10, cx + cw - 40, cy + 40))
+                    mt = self.hit(mk, click=lambda f=f: FriendLayer(self, f, "chat"),
+                                  tip="Message", box=(cx + cw - 68, cy + 10, cx + cw - 40,
+                                                      cy + 40))
                     self.circle(cx + cw - 54, cy + 25, 14, fill=self.hcol(mk, SURFACE, CARD_HI),
                                 tags=mt)
                     self.icon(cx + cw - 54, cy + 25, "chat", 10, self.hcol(mk, MUTED, TEXT),
@@ -12368,7 +13829,7 @@ class App(tk.Tk):
     def current_key(self):
         for item in self.cv.find_withtag("current"):
             for t in self.cv.gettags(item):
-                if t.startswith("hit:"):
+                if t.startswith("hit:") and (not self.layers or self.key_ok(t[4:])):
                     return t[4:]
         try:
             x = self.cv.winfo_pointerx() - self.cv.winfo_rootx()
@@ -12376,7 +13837,8 @@ class App(tk.Tk):
         except Exception:
             return None
         for (x0, y0, x1, y1), key in reversed(self.hit_boxes):
-            if x0 <= x <= x1 and y0 <= y <= y1 and key in self.hits:
+            if x0 <= x <= x1 and y0 <= y <= y1 and key in self.hits and \
+                    (not self.layers or self.key_ok(key)):
                 return key
         return None
 
@@ -12393,9 +13855,9 @@ class App(tk.Tk):
             self.hover_t = time.time()
             if key and (self.hits.get(key) or {}).get("tip"):
                 self.after(480, lambda k=key: self.hover == k and self.draw_overlays())
-            self.cv.config(cursor="hand2" if key and self.hits.get(key, {}).get("click")
-                           else "")
-            self.redraw()
+            hk = self.hits.get(key, {}) if key else {}
+            self.cv.config(cursor="hand2" if hk.get("click") or hk.get("down") else "")
+            self.layer_redraw() if self.layers else self.redraw()
 
     def fire(self, kind, event=None):
         key = self.current_key()
@@ -12416,16 +13878,39 @@ class App(tk.Tk):
             else:
                 self.close_pop()
             return
+        if self.layers and not key:
+            top = self.top_layer()
+            if top and top.dismiss:
+                x0, y0, x1, y1 = top.box
+                if not (x0 <= e.x <= x1 and y0 <= e.y <= y1):
+                    top.close()
+            return
         self.press = (key, e.x, e.y)
         self.dragging = None
         self.press_t = time.time()
-        if key and (self.hits.get(key) or {}).get("click"):
-            self.redraw()
+        hk = (self.hits.get(key) or {}) if key else {}
+        if hk.get("down"):
+            try:
+                hk["down"](e.x, e.y)
+            except Exception as ex:
+                self.log(f"down: {ex!r}")
+        if hk.get("click") or hk.get("down"):
+            self.layer_redraw() if self.layers else self.redraw()
 
     def on_drag(self, e):
         if not self.press:
             return
         key, px, py = self.press
+        hk = (self.hits.get(key) or {}) if key else {}
+        if hk.get("drag"):
+            try:
+                hk["drag"](e.x, e.y)
+            except Exception as ex:
+                self.log(f"drag: {ex!r}")
+            self.layer_redraw() if self.layers else self.redraw()
+            return
+        if self.layers:
+            return
         if self.dragging:
             self.drag_pos = (e.x, e.y)
             self.redraw()
@@ -12458,7 +13943,7 @@ class App(tk.Tk):
             if self.current_key() == pk:
                 self.press = None
                 self.fire("click")
-                self.redraw()
+                self.layer_redraw() if self.layers else self.redraw()
                 return
         if self.dragging:
             name = self.dragging
@@ -12473,7 +13958,7 @@ class App(tk.Tk):
             self.cv.config(cursor="")
             self.redraw()
         self.press = None
-        self.redraw()
+        self.layer_redraw() if self.layers else self.redraw()
 
     def on_wheel(self, e):
         try:
@@ -12485,6 +13970,13 @@ class App(tk.Tk):
             fn = getattr(self.sheets[-1], "on_wheel", None)
             if fn:
                 fn(e)
+            return
+        if self.layers:
+            top = self.top_layer()
+            if self.pop:
+                self.close_pop()
+            elif top:
+                top.on_wheel(e.delta)
             return
         if self.pop:
             self.close_pop()
@@ -12571,6 +14063,8 @@ class App(tk.Tk):
         return order.index(p) if p in order else len(order)
 
     def set_page(self, p):
+        if self.layers:
+            self.close_layers()
         if p != self.page:
             self.search_var.set("")
             self.page_t = time.time()
@@ -14154,7 +15648,7 @@ class App(tk.Tk):
                             threading.Thread(target=lambda: setattr(
                                 self, "enc", encounter_index(me)), daemon=True).start()
                     if data["phase"] == "pregame" and prev_phase != "pregame":
-                        if self.settings.get("match_sound"):
+                        if self.settings.get("match_sound") and PreviewAudio.current is None:
                             threading.Thread(target=play_chime, daemon=True).start()
                             flash_taskbar(self)
                         if self.settings.get("agent_picker", True):
@@ -14481,7 +15975,7 @@ class App(tk.Tk):
             return True
         for i in range(3):
             v = Modal(self, "Locked", "Enter your PIN." + (" Try again." if i else ""),
-                      password=True, ok="Unlock", cancel="Quit").result
+                      password=True, ok="Unlock", cancel="Quit", opaque=True).result
             if v is None:
                 return False
             if hmac.compare_digest(pin_hash(v, pin["salt"])[1], pin["hash"]):
