@@ -5,7 +5,6 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:    # "Run workflow" button on the Actions tab - pick a v* tag to build
 
 permissions:
   contents: write
