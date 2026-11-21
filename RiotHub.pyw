@@ -90,7 +90,7 @@ except Exception:
 
 APP_NAME = "RiotHub"
 OLD_APP_NAMES = ["RiotAccountSwitcher"]      # data folders from before the rename
-VERSION = "1.3.1"   # stamped from the release tag by the GitHub workflow
+VERSION = "1.3.3"   # stamped from the release tag by the GitHub workflow
 APP_TITLE = "RiotHub"
 # GitHub "owner/repo" whose releases this app updates from. Leave empty to turn updates off.
 UPDATE_REPO = ""
@@ -636,6 +636,51 @@ _LOCAL_CTX.check_hostname = False
 _LOCAL_CTX.verify_mode = ssl.CERT_NONE
 
 
+def _web_ctx():
+    """Certificates for real websites (GitHub, valorant-api, Riot). Python only sees the root
+    certificates already sitting in the Windows store, but Windows adds most roots lazily, the
+    first time its *own* networking needs one - so on many PCs GitHub's root isn't there yet and
+    every request fails with CERTIFICATE_VERIFY_FAILED. Trust the bundled Mozilla list too
+    (certifi), on top of the Windows store (which keeps antivirus / company roots working)."""
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+
+WEB_CTX = _web_ctx()
+urllib.request.install_opener(
+    urllib.request.build_opener(urllib.request.HTTPSHandler(context=WEB_CTX)))
+
+
+def is_cert_error(e):
+    r = getattr(e, "reason", e)
+    return (isinstance(r, ssl.SSLCertVerificationError)
+            or "CERTIFICATE_VERIFY_FAILED" in str(r))
+
+
+def curl_fetch(url, headers=None, out=None, timeout=60):
+    """Last resort when Python still can't verify a certificate: Windows' own curl.exe uses the
+    Windows TLS stack, which fetches a missing root from Windows Update by itself (and after
+    that Python requests work too). Returns bytes, or writes to `out` and returns None."""
+    exe = Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "curl.exe"
+    if not exe.exists():
+        raise RuntimeError("secure connection failed (the certificate couldn't be checked)")
+    cmd = [str(exe), "-sSfL", "--max-time", str(int(timeout)), "-A", UA]
+    for k, v in (headers or {}).items():
+        cmd += ["-H", f"{k}: {v}"]
+    cmd += ["-o", str(out)] if out else []
+    cmd.append(url)
+    r = subprocess.run(cmd, capture_output=True, timeout=timeout + 10, creationflags=NO_WINDOW)
+    if r.returncode != 0:
+        msg = (r.stderr or b"").decode("utf-8", "replace").strip().replace("curl: ", "")
+        raise RuntimeError(msg[:120] or f"download failed (curl {r.returncode})")
+    return None if out else r.stdout
+
+
 def http(url, headers=None, method="GET", body=None, timeout=12, local=False, raw=False):
     if isinstance(body, (bytes, bytearray)):
         data = bytes(body)
@@ -646,9 +691,14 @@ def http(url, headers=None, method="GET", body=None, timeout=12, local=False, ra
     if data is not None:
         h["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=h, method=method)
-    with urllib.request.urlopen(req, timeout=timeout,
-                                context=_LOCAL_CTX if local else None) as r:
-        payload = r.read()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=_LOCAL_CTX if local else None) as r:
+            payload = r.read()
+    except urllib.error.URLError as e:
+        if local or data is not None or method != "GET" or not is_cert_error(e):
+            raise
+        payload = curl_fetch(url, h, timeout=max(timeout, 15))
     if raw:
         return payload
     return json.loads(payload) if payload else None
@@ -696,6 +746,8 @@ def describe_err(e):
             bits.append(f"from {host}")
         return " · ".join(bits)
     if isinstance(e, urllib.error.URLError):
+        if is_cert_error(e):
+            return "secure connection failed (the certificate couldn't be checked)"
         return f"can't connect ({e.reason})"
     return str(e) or e.__class__.__name__
 
@@ -765,6 +817,34 @@ def detect_regions(lf, access):
     except Exception:
         pass
     return found
+
+
+_CV_CACHE = {"mt": None, "v": ""}
+
+
+def game_client_version():
+    """The exact build of VALORANT installed here, from its own log ("CI server version:
+    release-11.10-shipping-..."). Riot rejects changes (equipping, etc.) sent with an older
+    version, and valorant-api.com's copy can lag a patch by hours."""
+    log = LOCAL / "VALORANT" / "Saved" / "Logs" / "ShooterGame.log"
+    try:
+        mt = log.stat().st_mtime
+    except Exception:
+        return ""
+    if _CV_CACHE["mt"] == mt:
+        return _CV_CACHE["v"]
+    v = ""
+    try:
+        with open(log, "rb") as f:
+            head = f.read(2 * 1024 * 1024).decode("utf-8", "ignore")
+        m = re.search(r"CI server version:\s*(release-[\w.\-]+)", head)
+        if m:
+            v = m.group(1)
+            # the log prints "...-shipping-11-2662335"; the header wants the same shape
+    except Exception:
+        pass
+    _CV_CACHE.update(mt=mt, v=v)
+    return v
 
 
 # ================================================================ valorant-api.com assets
@@ -1709,7 +1789,8 @@ class ValClient:
         return {"Authorization": "Bearer " + self.access,
                 "X-Riot-Entitlements-JWT": self.ent,
                 "X-Riot-ClientPlatform": CLIENT_PLATFORM,
-                "X-Riot-ClientVersion": ASSETS.version or ""}
+                "X-Riot-ClientVersion": getattr(self, "_cv_override", None)
+                or game_client_version() or ASSETS.version or ""}
 
     def pd(self, path, method="GET", body=None, timeout=12):
         return http(f"https://pd.{self.shard}.a.pvp.net{path}", self.headers(), method, body,
@@ -1804,7 +1885,23 @@ class ValClient:
 
     def put_loadout(self, lo):
         v = getattr(self, "_lo_ver", "v2")
-        return self.pd(f"/personalization/{v}/players/{self.puuid}/playerloadout", "PUT", lo)
+        path = f"/personalization/{v}/players/{self.puuid}/playerloadout"
+        body = {k: val for k, val in lo.items() if k not in ("Subject", "Version")}
+        try:
+            return self.pd(path, "PUT", body)
+        except urllib.error.HTTPError as e:
+            if e.code not in (400, 403, 409):
+                raise
+            # most often a stale client version right after a patch: get the live one, retry
+            try:
+                live = http(Assets.BASE + "/version", timeout=8)["data"]["riotClientVersion"]
+            except Exception:
+                raise e
+            if not live or live == self.headers()["X-Riot-ClientVersion"]:
+                raise
+            self._cv_override = live
+            ASSETS.version = live
+            return self.pd(path, "PUT", body)
 
 
 def decode_settings(data):
@@ -3204,7 +3301,7 @@ class StatusProxy:
             if not host:
                 raise RuntimeError("chat server unknown (config wasn't intercepted)")
             up_raw = socket.create_connection((host, self.real_port), timeout=15)
-            up = ssl.create_default_context().wrap_socket(up_raw, server_hostname=host)
+            up = WEB_CTX.wrap_socket(up_raw, server_hostname=host)
             up.settimeout(None)
             client.settimeout(None)
         except Exception as e:
@@ -5430,6 +5527,28 @@ def set_app_volume(frac):
         return False
 
 
+_TIMER_FINE = [0]
+
+
+def timer_resolution(fine):
+    """Ask Windows for 1 ms timers while a video plays (its default ~16 ms tick makes 30/60 fps
+    frames land unevenly). Reference-counted; released when playback stops."""
+    if sys.platform != "win32":
+        return
+    try:
+        w = ctypes.windll.winmm
+        if fine:
+            if _TIMER_FINE[0] == 0:
+                w.timeBeginPeriod(1)
+            _TIMER_FINE[0] += 1
+        elif _TIMER_FINE[0] > 0:
+            _TIMER_FINE[0] -= 1
+            if _TIMER_FINE[0] == 0:
+                w.timeEndPeriod(1)
+    except Exception:
+        pass
+
+
 def extract_audio_wav(src, dst, gain=1.0):
     """Decode a preview video's soundtrack to a 44.1 kHz stereo WAV with PyAV.
     Returns False when the video has no audio track."""
@@ -5473,6 +5592,111 @@ def extract_audio_wav(src, dst, gain=1.0):
     return True
 
 
+class WaveOut:
+    """Plays 16-bit PCM straight through the Windows audio device (winmm waveOut) from memory.
+    Unlike PlaySound it starts at once (nothing to load from disk) and it can say exactly how
+    far playback has got, which the video uses as its clock so picture and sound stay in step."""
+
+    class _FMT(ctypes.Structure):
+        _pack_ = 1                              # mmreg.h packs WAVEFORMATEX to 18 bytes
+        _fields_ = [("wFormatTag", ctypes.c_ushort), ("nChannels", ctypes.c_ushort),
+                    ("nSamplesPerSec", ctypes.c_uint32), ("nAvgBytesPerSec", ctypes.c_uint32),
+                    ("nBlockAlign", ctypes.c_ushort), ("wBitsPerSample", ctypes.c_ushort),
+                    ("cbSize", ctypes.c_ushort)]
+
+    class _HDR(ctypes.Structure):
+        pass
+
+    _HDR._fields_ = [("lpData", ctypes.c_void_p), ("dwBufferLength", ctypes.c_uint32),
+                     ("dwBytesRecorded", ctypes.c_uint32), ("dwUser", ctypes.c_size_t),
+                     ("dwFlags", ctypes.c_uint32), ("dwLoops", ctypes.c_uint32),
+                     ("lpNext", ctypes.c_void_p), ("reserved", ctypes.c_size_t)]
+
+    class _MMTIME(ctypes.Structure):
+        _fields_ = [("wType", ctypes.c_uint32), ("value", ctypes.c_uint32),
+                    ("pad", ctypes.c_uint32)]
+
+    _api = None
+
+    @classmethod
+    def api(cls):
+        if cls._api is None:
+            w = ctypes.windll.winmm
+            H, P, U = ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32
+            w.waveOutOpen.argtypes = [ctypes.POINTER(H), U, P, ctypes.c_size_t,
+                                      ctypes.c_size_t, U]
+            for f in ("waveOutPrepareHeader", "waveOutUnprepareHeader", "waveOutWrite",
+                      "waveOutGetPosition"):
+                getattr(w, f).argtypes = [H, P, U]
+            for f in ("waveOutReset", "waveOutClose"):
+                getattr(w, f).argtypes = [H]
+            w.waveOutSetVolume.argtypes = [H, U]
+            for f in ("waveOutOpen", "waveOutPrepareHeader", "waveOutUnprepareHeader",
+                      "waveOutWrite", "waveOutGetPosition", "waveOutReset", "waveOutClose",
+                      "waveOutSetVolume"):
+                getattr(w, f).restype = U
+            cls._api = w
+        return cls._api
+
+    def __init__(self, pcm, rate=44100, channels=2):
+        w = self.api()
+        self.rate, self.block = rate, channels * 2
+        self.duration = len(pcm) / (rate * self.block)
+        self.buf = ctypes.create_string_buffer(pcm, len(pcm))     # must outlive playback
+        fmt = self._FMT(1, channels, rate, rate * self.block, self.block, 16, 0)
+        self.h = ctypes.c_void_p()
+        if w.waveOutOpen(ctypes.byref(self.h), 0xFFFFFFFF, ctypes.byref(fmt), 0, 0, 0):
+            raise RuntimeError("no audio output device")
+        self.hdr = self._HDR()
+        self.hdr.lpData = ctypes.cast(self.buf, ctypes.c_void_p)
+        self.hdr.dwBufferLength = len(pcm)
+        if w.waveOutPrepareHeader(self.h, ctypes.byref(self.hdr), ctypes.sizeof(self.hdr)):
+            w.waveOutClose(self.h)
+            raise RuntimeError("audio device refused the sound")
+        self.playing = False
+
+    def play(self):
+        """(Re)start from the beginning."""
+        w = self.api()
+        w.waveOutReset(self.h)
+        self.hdr.dwFlags &= 0x00000002          # keep only WHDR_PREPARED
+        if w.waveOutWrite(self.h, ctypes.byref(self.hdr), ctypes.sizeof(self.hdr)):
+            raise RuntimeError("audio device refused the sound")
+        self.playing = True
+
+    def position(self):
+        """Seconds actually played so far (0 until the device really starts)."""
+        t = self._MMTIME(4, 0, 0)               # TIME_BYTES
+        if self.api().waveOutGetPosition(self.h, ctypes.byref(t), ctypes.sizeof(t)):
+            return None
+        if t.wType == 4:
+            return t.value / (self.rate * self.block)
+        if t.wType == 2:                        # TIME_SAMPLES
+            return t.value / self.rate
+        if t.wType == 1:                        # TIME_MS
+            return t.value / 1000
+        return None
+
+    def volume(self, frac):
+        v = max(0, min(0xFFFF, int(frac * 0xFFFF)))
+        self.api().waveOutSetVolume(self.h, v | (v << 16))
+
+    def stop(self):
+        if self.playing:
+            self.api().waveOutReset(self.h)
+            self.playing = False
+
+    def close(self):
+        try:
+            w = self.api()
+            w.waveOutReset(self.h)
+            w.waveOutUnprepareHeader(self.h, ctypes.byref(self.hdr), ctypes.sizeof(self.hdr))
+            w.waveOutClose(self.h)
+        except Exception:
+            pass
+        self.playing = False
+
+
 class PreviewAudio:
     """The soundtrack of a skin preview, restarted with every loop of the video so the two
     stay in step. Only one preview can make sound at a time, app-wide; volume and mute are
@@ -5486,6 +5710,8 @@ class PreviewAudio:
         self.err = ""
         self.stopped = False
         self._fallback_gain = None
+        self.out = None               # WaveOut, when the device opened
+        self.started_at = None        # wall clock of the last (re)start, for the fallback
 
     @staticmethod
     def supported():
@@ -5517,6 +5743,15 @@ class PreviewAudio:
                     self.status = "none"
                     return
             self.wav = dst
+            try:
+                import wave
+                with wave.open(str(dst)) as r:
+                    pcm = r.readframes(r.getnframes())
+                    rate, ch = r.getframerate(), r.getnchannels()
+                if not self.stopped:
+                    self.out = WaveOut(pcm, rate, ch)
+            except Exception:
+                self.out = None       # PlaySound below still works, just less precisely
             self.status = "ready"
         except Exception as e:
             self.status, self.err = "error", describe_err(e)
@@ -5533,6 +5768,16 @@ class PreviewAudio:
             PreviewAudio.current.stop()
         PreviewAudio.current = self
         wav = self.wav
+        self.started_at = time.time()
+        if self.out:
+            try:
+                # muted = volume 0 but still playing, so unmuting is instant and in sync
+                self.out.volume(self.level())
+                self.out.play()
+                return
+            except Exception:
+                self.out.close()
+                self.out = None
         try:
             if set_app_volume(self.level()):
                 # muted = volume 0 but still playing, so unmuting is instant and in sync
@@ -5565,14 +5810,32 @@ class PreviewAudio:
                 return self.wav
         return p
 
+    def clock(self):
+        """How far into the soundtrack playback really is, or None if unknown."""
+        if self.out and self.out.playing and PreviewAudio.current is self:
+            try:
+                return self.out.position()
+            except Exception:
+                return None
+        return None
+
     def apply(self):
         """Volume or mute changed while playing."""
         if PreviewAudio.current is self and not self.stopped:
+            if self.out:
+                try:
+                    self.out.volume(self.level())
+                    return
+                except Exception:
+                    pass
             if not set_app_volume(self.level()):
                 self.start()           # fallback path re-renders at the new level
 
     def stop(self):
         self.stopped = True
+        out, self.out = self.out, None
+        if out:
+            out.close()
         if PreviewAudio.current is self:
             PreviewAudio.current = None
             try:
@@ -5596,6 +5859,10 @@ class VideoPlayer:
         self.fps = 30.0
         self.photo = None
         self.last = 0.0
+        self.pending = None           # next (image, time, first) waiting for its moment
+        self.t0 = None                # wall clock when the current loop started
+        self.shown_t = -1.0           # timestamp of the frame on screen
+        self._fine = False            # holding Windows' 1 ms timer
         self.status = "Loading video…"
         self.on_text(self.status)
         threading.Thread(target=self._work, daemon=True).start()
@@ -5618,6 +5885,9 @@ class VideoPlayer:
         self.stop_flag = True
         if self.audio:
             self.audio.stop()
+        if self._fine:
+            self._fine = False
+            timer_resolution(False)
 
     _fetching = set()
 
@@ -5709,14 +5979,14 @@ class VideoPlayer:
                 n = 0
                 if src == self.url and cached.exists() and cached.stat().st_size > 1000:
                     src = cached
-                for im in (self._frames_av(src) if be == "av" else self._frames_cv(src)):
+                for im, t in (self._frames_av(src) if be == "av" else self._frames_cv(src)):
                     if n == 0:
                         self._say("")
                     if self.stop_flag:
                         return
                     while not self.stop_flag:          # bounded wait so stop() is prompt
                         try:
-                            self.q.put((im, n == 0), timeout=0.25)
+                            self.q.put((im, t, n == 0), timeout=0.25)
                             break
                         except queue.Full:
                             continue
@@ -5737,12 +6007,20 @@ class VideoPlayer:
             except Exception:
                 self.fps = 30.0
             size = None
+            start = None
+            n = 0
             for fr in box.decode(st):
                 if self.stop_flag:
                     return
                 if size is None:
                     size = self._fit(fr.width, fr.height)
-                yield fr.to_image(width=size[0], height=size[1])
+                t = fr.time
+                if t is None:
+                    t = n / self.fps
+                if start is None:
+                    start = t
+                n += 1
+                yield fr.to_image(width=size[0], height=size[1]), max(0.0, t - start)
 
     def _frames_cv(self, path):
         import cv2
@@ -5750,6 +6028,7 @@ class VideoPlayer:
         try:
             self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             size = None
+            n = 0
             while not self.stop_flag:
                 ok, fr = cap.read()
                 if not ok:
@@ -5757,37 +6036,79 @@ class VideoPlayer:
                 if size is None:
                     size = self._fit(fr.shape[1], fr.shape[0])
                 fr = cv2.resize(fr, size, interpolation=cv2.INTER_AREA)
-                yield Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
+                yield Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)), n / self.fps
+                n += 1
         finally:
             cap.release()
 
     def _tick(self):
         if self.stop_flag:
+            if self._fine:
+                self.stop()
             return
         try:
             if not self.label.winfo_exists():
-                self.stop_flag = True
+                self.stop()
                 return
         except tk.TclError:
-            self.stop_flag = True
+            self.stop()
             return
-        now = time.time()
-        if now - self.last >= 1 / max(1.0, self.fps) - 0.004:
-            try:
-                im, first = self.q.get_nowait()
-            except queue.Empty:
-                im, first = None, False
-            if first and self.audio:
-                self.audio.start()          # every loop restarts the sound with the picture
-            if im is not None:
-                self.last = now
-                if self.photo is None or (self.photo.width(), self.photo.height()) != im.size:
-                    self.photo = ImageTk.PhotoImage(im)
-                    self.label.config(image=self.photo, text="")
-                    self.label.image = self.photo
-                else:
-                    self.photo.paste(im)
-        self.app.after(8, self._tick)
+        im = self._due(time.time())
+        if im is not None:
+            self.last = time.time()
+            if self.photo is None or (self.photo.width(), self.photo.height()) != im.size:
+                self.photo = ImageTk.PhotoImage(im)
+                self.label.config(image=self.photo, text="")
+                self.label.image = self.photo
+            else:
+                self.photo.paste(im)
+        self.app.after(5, self._tick)
+
+    def _clock(self, now):
+        """Position in the current loop. Follows the sound's real playback position when
+        there is one, so the picture can never drift away from what you hear."""
+        if self.t0 is None:
+            return -1.0
+        a = self.audio.clock() if self.audio else None
+        wall = now - self.t0
+        if a is None:
+            return wall
+        if a <= 0 and wall < 1.0:
+            return 0.0                    # device hasn't started yet: hold the first frame
+        out = self.audio.out
+        if out and a >= out.duration - 0.03 and wall > a:
+            return wall                   # soundtrack shorter than the video: carry on
+        return a
+
+    def _due(self, now):
+        """The newest frame whose time has come (late frames are skipped, not queued up)."""
+        show = None
+        while True:
+            if self.pending is None:
+                try:
+                    self.pending = self.q.get_nowait()
+                except queue.Empty:
+                    return show
+            im, t, first = self.pending
+            if first:
+                # a new loop: start it once the previous one has run its course
+                if self.t0 is not None and self._clock(now) < self.shown_t + 1 / max(1.0, self.fps):
+                    return show
+                if not self._fine:
+                    self._fine = True
+                    timer_resolution(True)
+                if self.audio:
+                    self.audio.start()    # restart the sound together with the picture
+                self.t0 = now
+                self.shown_t = t
+                self.pending = None
+                show = im
+                continue
+            if t > self._clock(now):
+                return show
+            self.shown_t = t
+            self.pending = None
+            show = im
 
 
 class SheetModal(Sheet):
@@ -6245,17 +6566,24 @@ class UpdateSheet(Sheet):
                     new = cur.with_name(cur.stem + ".new.exe")
                 req = urllib.request.Request(url, headers={"User-Agent": UA})
                 got = 0
-                with urllib.request.urlopen(req, timeout=60) as r, open(new, "wb") as fh:
-                    while True:
-                        chunk = r.read(256 * 1024)
-                        if not chunk:
-                            break
-                        fh.write(chunk)
-                        got += len(chunk)
-                        if size:
-                            pct = int(100 * got / size)
-                            self.app.call_ui(lambda p=pct: self.status.config(
-                                text=f"Downloading… {p}%"))
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as r, open(new, "wb") as fh:
+                        while True:
+                            chunk = r.read(256 * 1024)
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                            got += len(chunk)
+                            if size:
+                                pct = int(100 * got / size)
+                                self.app.call_ui(lambda p=pct: self.status.config(
+                                    text=f"Downloading… {p}%"))
+                except urllib.error.URLError as e:
+                    if not is_cert_error(e):
+                        raise
+                    self.app.call_ui(lambda: self.status.config(text="Downloading…"))
+                    curl_fetch(url, out=new, timeout=600)
+                    got = Path(new).stat().st_size
                 if size and got != size:
                     raise RuntimeError("the download was incomplete")
                 wait = (f"for /l %%i in (1,1,40) do (tasklist /fi \"PID eq {os.getpid()}\" "
@@ -8419,7 +8747,8 @@ class App(tk.Tk):
         self._bar_i = getattr(self, "_bar_i", 0) + 1
         k = "bar:" + (key or f"{self.page}:{self._bar_i}")
         frac = max(0.0, min(1.0, float(frac or 0)))
-        f = self.tween_from(k, 0.0, frac, 0.75, "quint", delay=min(0.35, 0.03 * self._bar_i))
+        # drawn at its value straight away: a growing bar is a new image every frame
+        f = frac
         self.rrect(x, y, x + w, y + h, h / 2, fill=bg or CARD)
         if f > 0.002:
             col = color or ACCENT
@@ -8607,13 +8936,9 @@ class App(tk.Tk):
             now_ = time.time()
             self._tw = {k: v for k, v in self._tw.items()
                         if now_ - v[2] < v[3] + 0.5 or k.startswith(("cnt:", "bar:"))}
-        target = self.glow_target()
-        if anim and self.glow_cur != target:
-            nxt = mix(self.glow_cur, target, 0.18)
-            self.glow_cur = target if nxt == self.glow_cur else nxt
-            self._more = True
-        else:
-            self.glow_cur = target
+        # no fade between rank colours: every in-between colour was a brand-new full-window
+        # image (~15 MP pushed into Tk per account click) - the main source of click lag
+        self.glow_cur = self.glow_target()
         c.create_rectangle(0, 0, w, h, fill=BG, outline="")
         cx, cy, R = w * 0.58, h * 0.98, max(w, h) * 0.78
         bgp = self.bg_image(w, h) or self.glow_photo(w, h, self.glow_cur)
@@ -8759,8 +9084,12 @@ class App(tk.Tk):
         if not HAS_PIL:
             return None
         key = (w, h, col, BG)
-        if self._bg_cache and self._bg_cache[0] == key:
-            return self._bg_cache[1]
+        cache = self.__dict__.setdefault("_glow_lru", {})
+        if key in cache:
+            ph, pil = cache.pop(key)
+            cache[key] = (ph, pil)              # most recent last
+            self._bg_cache, self._bg_pil = (key, ph), pil
+            return ph
         try:
             sw, sh = max(8, w // 4), max(8, h // 4)
             rgb = lambda c_: tuple(int(c_[i:i + 2], 16) for i in (1, 3, 5))  # noqa: E731
@@ -8775,6 +9104,9 @@ class App(tk.Tk):
             ph = ImageTk.PhotoImage(full)
             self._bg_cache = (key, ph)
             self._bg_pil = full
+            cache[key] = (ph, full)
+            while len(cache) > 6:               # a few rank colours / window sizes
+                cache.pop(next(iter(cache)))
             return ph
         except Exception:
             return None
@@ -8800,7 +9132,9 @@ class App(tk.Tk):
         return mix(mix(GLOW, tc, 0.5), BG, 0.3)
 
     def scroll(self):
-        return self.scrolls.get(self.page, 0)
+        # whole pixels: the canvas can't draw between them, and fractional offsets made
+        # cached images (graph, rounded shapes) miss the cache on every scroll frame
+        return int(round(self.scrolls.get(self.page, 0)))
 
     def reset_scroll(self):
         self.scrolls[self.page] = 0
@@ -11396,7 +11730,7 @@ class App(tk.Tk):
         coords = []
         for i, v in enumerate(vals):
             coords += [gx0 + gw * i / (n - 1), py(v)]
-        reveal = self.tween_from("cnt:graph", 0.0, 1.0, 0.9, "quint", delay=0.08)
+        reveal = 1.0          # no left-to-right reveal: it re-rendered the graph every frame
         if HAS_PIL:
             self.graph_image(coords, int(gx0), int(y), int(gw), int(h), reveal)
         else:
@@ -11419,7 +11753,9 @@ class App(tk.Tk):
     def graph_image(self, coords, gx, gy, gw, gh, reveal=1.0):
         """Anti-aliased line + gradient fill for the RR graph (revealed left to right)."""
         step = max(1, min(12, round(reveal * 12)))
-        base_key = ("graph", tuple(round(c) for c in coords), gx, gy, gw, gh, ACCENT, SURFACE)
+        # keyed on the shape relative to the graph's corner, so scrolling reuses the image
+        rel = tuple(round(c - (gx if i % 2 == 0 else gy)) for i, c in enumerate(coords))
+        base_key = ("graph", rel, gw, gh, ACCENT, SURFACE)
         key = base_key + (step,)
         im = self._shapes.get(key)
         if im is None and step < 12:
@@ -15394,12 +15730,20 @@ class App(tk.Tk):
                     break
             else:
                 raise RuntimeError("That weapon isn't in your loadout.")
-            vc.put_loadout(lo)
+            res = vc.put_loadout(lo) or {}
+            # check Riot really took it, rather than assuming
+            got = next((g for g in res.get("Guns") or []
+                        if str(g.get("ID", "")).lower() == s["weapon_id"].lower()), None)
+            if res.get("Guns") and (not got or str(got.get("SkinID", "")).lower()
+                                    != skin_uuid.lower()):
+                raise RuntimeError("Riot didn't accept the change - do you own this skin on "
+                                   f"{a}?")
             eq = dict(self.m(a).get("loadout") or {})
             eq[s["weapon_id"]] = {"skin": skin_uuid, "chroma": ch}
             self.call_ui(lambda: self.update_meta(a, {"loadout": eq}))
             self.set_status(f"Equipped {s['name']}.", "good")
-        self.run(go, guard=False)
+        if not self.run(go, guard=False):
+            return
 
     def equip_identity(self, kind, item_id):
         field = {"card": "PlayerCardID", "title": "PlayerTitleID"}[kind]
