@@ -90,7 +90,7 @@ except Exception:
 
 APP_NAME = "RiotHub"
 OLD_APP_NAMES = ["RiotAccountSwitcher"]      # data folders from before the rename
-VERSION = "1.3.3"   # stamped from the release tag by the GitHub workflow
+VERSION = "1.3.4"   # stamped from the release tag by the GitHub workflow
 APP_TITLE = "RiotHub"
 # GitHub "owner/repo" whose releases this app updates from. Leave empty to turn updates off.
 UPDATE_REPO = ""
@@ -8061,6 +8061,8 @@ class App(tk.Tk):
         self.cv.bind("<Double-Button-1>", lambda e: self.fire("dbl", e))
         self.cv.bind("<Button-3>", lambda e: self.fire("right", e))
         self.bind_all("<MouseWheel>", self.on_wheel)
+        self.bind_all("<Control-Shift-F>", lambda e: self.toggle_perf_hud())
+        self.bind_all("<Control-Shift-f>", lambda e: self.toggle_perf_hud())
         self.key("<Control-f>", lambda e: self.focus_search())
         for k, d in (("<Left>", -1), ("<Right>", 1), ("<Up>", -4), ("<Down>", 4)):
             self.key(k, lambda e, d=d: self.nav(d))
@@ -8907,8 +8909,74 @@ class App(tk.Tk):
         self._pending = True
         self.after_idle(self._draw)
 
+    # ------------------------------------------------------------- frame pacing
+    FRAME = 1 / 60
+
+    def next_frame(self, fn):
+        """Schedule the next animation frame on a steady 60 fps clock. Waiting a flat 16 ms
+        *after* each frame (plus Windows' default ~16 ms timer tick) gave 25-30 fps with
+        uneven gaps - choppy on any PC. While anything animates we hold Windows' 1 ms timer
+        and subtract the time the frame took."""
+        now = self.hold_fine_timer()
+        start = getattr(self, "_frame_t0", now)
+        delay = max(1, int((self.FRAME - (now - start)) * 1000))
+        self.after(delay, fn)
+
+    def hold_fine_timer(self):
+        now = time.perf_counter()
+        if not getattr(self, "_fine_timer", False):
+            self._fine_timer = True
+            timer_resolution(True)
+            self.after(500, self._fine_timer_check)
+        self._fine_until = now + 1.5
+        return now
+
+    def _fine_timer_check(self):
+        if time.perf_counter() < getattr(self, "_fine_until", 0):
+            self.after(500, self._fine_timer_check)
+        else:
+            self._fine_timer = False
+            timer_resolution(False)
+
+    def toggle_perf_hud(self):
+        self.perf_hud = not getattr(self, "perf_hud", False)
+        self._perf = []
+        self.redraw()
+
+    def _perf_note(self, draw_ms):
+        """Frame stats for the Ctrl+Shift+F readout: Python build time, Tk paint time
+        (measured by an idle callback queued behind the canvas repaint) and frame rate."""
+        t_end = time.perf_counter()
+        t0 = self._frame_t0
+
+        def painted():
+            now = time.perf_counter()
+            self._perf.append((t0, draw_ms, (now - t_end) * 1000))
+            self._perf = self._perf[-90:]
+            self._perf_paint()
+        self.after_idle(painted)
+
+    def _perf_paint(self):
+        c = self.cv
+        c.delete("perfhud")
+        f = [p for p in self._perf if time.perf_counter() - p[0] < 1.0]
+        if len(f) >= 2:
+            fps = (len(f) - 1) / max(1e-3, f[-1][0] - f[0][0])
+        else:
+            fps = 0
+        dr = sum(p[1] for p in f) / max(1, len(f))
+        pt = sum(p[2] for p in f) / max(1, len(f))
+        worst = max((p[1] + p[2] for p in f), default=0)
+        txt = (f"{fps:4.0f} fps   build {dr:4.1f} ms   paint {pt:4.1f} ms   worst {worst:4.0f} ms"
+               f"   items {len(c.find_all())}")
+        w = c.winfo_width()
+        c.create_rectangle(w - 470, 6, w - 8, 30, fill="#000000", outline="", tags="perfhud")
+        c.create_text(w - 14, 18, text=txt, anchor="e", fill="#7CFFB2",
+                      font=("Consolas", 10), tags="perfhud")
+
     def _draw(self):
         self._pending = False
+        self._frame_t0 = time.perf_counter()
         c = self.cv
         try:
             had_focus = self.focus_get() is self.search
@@ -8981,15 +9049,17 @@ class App(tk.Tk):
             lmark = (c.find_all() or (0,))[-1]
             self.draw_layers(w, h)
             for item in c.find_all():
+                if item <= lmark:
+                    continue
                 tg = c.gettags(item)
-                if item > lmark and "lyrwin" not in tg and "lyrscrim" not in tg:
+                if "lyrwin" not in tg and "lyrscrim" not in tg:
                     c.addtag_withtag("lyr", item)
             lyr_more, lyr_shim = self._more, self._shimmer
             self._more = self._shimmer = False
         self._hb_base = len(self.hit_boxes)
         self.draw_overlays()
         if lyr_more:
-            self.after(16, self.layer_redraw)
+            self.next_frame(self.layer_redraw)
         elif lyr_shim:
             self.after(60, self.layer_redraw)
         if had_focus and self.search_shown:
@@ -9003,9 +9073,11 @@ class App(tk.Tk):
         if self.sheets:          # covered by a dialog: don't spend frames on the page
             self._more = self._shimmer = False
         if self._more:
-            self.after(16, self.redraw)
+            self.next_frame(self.redraw)
         elif self._shimmer:
             self.after(60, self.redraw)
+        if getattr(self, "perf_hud", False):
+            self._perf_note((time.perf_counter() - self._frame_t0) * 1000)
 
 
     # ---- page & tab transitions: content glides in while the background fades it up
@@ -9365,6 +9437,7 @@ class App(tk.Tk):
         self._lyr_pending = False
         if self._pending:
             return                      # a full redraw is on its way anyway
+        self._frame_t0 = time.perf_counter()
         c = self.cv
         c.delete("lyr")
         c.delete("ovl")
@@ -9377,17 +9450,21 @@ class App(tk.Tk):
         marker = (c.find_all() or (0,))[-1]
         self.draw_layers(w, h)
         for item in c.find_all():
+            if item <= marker:          # only ask Tk about the items just drawn
+                continue
             tg = c.gettags(item)
-            if item > marker and "lyrwin" not in tg and "lyrscrim" not in tg:
+            if "lyrwin" not in tg and "lyrscrim" not in tg:
                 c.addtag_withtag("lyr", item)
         more, shim = self._more, self._shimmer
         self._more, self._shimmer = saved
         self._hb_base = len(self.hit_boxes)
         self.draw_overlays()
         if more:
-            self.after(16, self.layer_redraw)
+            self.next_frame(self.layer_redraw)
         elif shim:
             self.after(60, self.layer_redraw)
+        if getattr(self, "perf_hud", False):
+            self._perf_note((time.perf_counter() - self._frame_t0) * 1000)
 
     def key_ok(self, key):
         """While a layer is open, only its own controls (and toasts/menus) respond."""
@@ -9568,6 +9645,7 @@ class App(tk.Tk):
                     pass
         if more:
             self._sheet_loop = True
+            self.hold_fine_timer()
             self.after(16, self._sheet_tick)
 
     def _sheets_relayout(self):
@@ -9640,6 +9718,7 @@ class App(tk.Tk):
         self.pop = None
         self.redraw()
         if it and it.get("fn") and not it.get("disabled"):
+            self.hold_fine_timer()
             self.after(15, it["fn"])
 
     def draw_pop(self, w, h):
